@@ -24,7 +24,7 @@ natively on your system.
 
 ### Run TensorFlow CI Scripts Natively on your Machine
 
-1.  Follow the instructions at https://www.tensorflow.org/install/install_sources,
+1.  Follow the instructions at https://www.tensorflow.org/install/source,
     but stop when you get to the section "Configure the installation". You do not
     need to configure the installation to run the CI scripts.
 
@@ -67,10 +67,45 @@ this UI, to see the logs for a failed build:
     the build tool divided the target into multiple shards or ran the test
     multiple times. Each test log is specific to the shard, run, and attempt.
     To see a specific log:
-    
+
     1.  Click on the log icon that is on the right next to the shard, run,
         and attempt number.
-        
+
     2.  In the grid that appears on the right, click on the specific shard,
         run, and attempt to view its log. You can also type the desired shard,
         run, or attempt number in the field above its grid.
+
+### Third party TensorFlow CI
+
+#### [Mellanox](https://www.mellanox.com/) TensorFlow CI
+
+##### How to start CI
+
+*   Submit special pull request (PR) comment to trigger CI: **bot:mlx:test**
+*   Test session is run automatically.
+*   Test results and artifacts (log files) are reported via PR comments
+
+##### CI Steps
+
+CI includes the following steps: * Build TensorFlow (GPU version) * Run
+TensorFlow tests: *
+[TF CNN benchmarks](https://github.com/tensorflow/benchmarks/blob/master/scripts/tf_cnn_benchmarks/tf_cnn_benchmarks.py)
+(TensorFlow 1.13 and less) *
+[TF models](https://github.com/tensorflow/models/tree/master/official/r1/resnet)
+(TensorFlow 2.0): ResNet, synthetic data, NCCL, multi_worker_mirrored
+distributed strategy
+
+##### Test Environment
+
+CI is run in the Mellanox lab on a 2-node cluster with the following parameters:
+* Hardware * IB: 1x ConnectX-6 HCA (connected to Mellanox Quantum™ HDR switch) *
+GPU: 1x Nvidia Tesla K40m * Software * Ubuntu 16.04.6 * Internal stable
+[MLNX_OFED](https://www.mellanox.com/page/products_dyn?product_family=26),
+[HPC-X™](https://www.mellanox.com/page/hpcx_overview) and
+[SHARP™](https://www.mellanox.com/page/products_dyn?product_family=261&mtag=sharp)
+versions
+
+##### Support (Mellanox)
+
+With any questions/suggestions or in case of issues contact
+[Artem Ryabov](mailto:artemry@mellanox.com).

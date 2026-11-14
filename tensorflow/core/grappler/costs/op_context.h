@@ -13,9 +13,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef THIRD_PARTY_TENSORFLOW_CORE_GRAPPLER_COSTS_OP_CONTEXT_H_
-#define THIRD_PARTY_TENSORFLOW_CORE_GRAPPLER_COSTS_OP_CONTEXT_H_
+#ifndef TENSORFLOW_CORE_GRAPPLER_COSTS_OP_CONTEXT_H_
+#define TENSORFLOW_CORE_GRAPPLER_COSTS_OP_CONTEXT_H_
 
+#include "absl/container/flat_hash_map.h"
 #include "tensorflow/core/framework/function.pb.h"
 #include "tensorflow/core/grappler/costs/op_performance_data.pb.h"
 
@@ -25,15 +26,19 @@ namespace grappler {
 // A structure to keep the context of op execution, including its shape,
 // execution context, and other relevant information.
 struct OpContext {
-  string name;
-  string device_name;
+  std::string name;
+  std::string device_name;
   OpInfo op_info;
   const FunctionDefLibrary* function_library;  // Not owned.
-
+  // This map is used to stash meta attributes so that they may be
+  // communicated, for instance, from the scheduler that creates them to the
+  // CostEstimator or EventCostManager that uses them.
+  absl::flat_hash_map<std::string, std::variant<int64_t, std::string>>
+      op_meta_attributes;
   OpContext() { function_library = nullptr; }
 };
 
 }  // end namespace grappler
 }  // end namespace tensorflow
 
-#endif  // THIRD_PARTY_TENSORFLOW_CORE_GRAPPLER_COSTS_OP_CONTEXT_H_
+#endif  // TENSORFLOW_CORE_GRAPPLER_COSTS_OP_CONTEXT_H_

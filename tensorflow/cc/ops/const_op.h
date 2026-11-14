@@ -13,8 +13,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef THIRD_PARTY_TENSORFLOW_CC_OPS_CONST_OP_H_
-#define THIRD_PARTY_TENSORFLOW_CC_OPS_CONST_OP_H_
+#ifndef TENSORFLOW_CC_OPS_CONST_OP_H_
+#define TENSORFLOW_CC_OPS_CONST_OP_H_
+
+#include <vector>
 
 #include "tensorflow/cc/framework/ops.h"
 #include "tensorflow/cc/framework/scope.h"
@@ -82,4 +84,4 @@ std::vector<NodeBuilder::NodeOut> AsNodeOutList(const Scope& scope,
 }  // namespace ops
 }  // namespace tensorflow
 
-#endif  // THIRD_PARTY_TENSORFLOW_CC_OPS_CONST_OP_H_
+#endif  // TENSORFLOW_CC_OPS_CONST_OP_H_

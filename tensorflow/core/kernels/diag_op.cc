@@ -17,20 +17,20 @@ limitations under the License.
 
 #define EIGEN_USE_THREADS
 
-#if GOOGLE_CUDA
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 #define EIGEN_USE_GPU
-#endif  // GOOGLE_CUDA
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
 #include "tensorflow/core/kernels/diag_op.h"
 
 #include <algorithm>
-#include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
+#include "unsupported/Eigen/CXX11/Tensor"  // from @eigen_archive
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/tensor_types.h"
-#include "tensorflow/core/platform/types.h"
 #include "tensorflow/core/platform/logging.h"
+#include "tensorflow/core/platform/types.h"
 #include "tensorflow/core/util/work_sharder.h"
 
 namespace tensorflow {
@@ -47,23 +47,23 @@ class DiagOp : public OpKernel {
   void Compute(OpKernelContext* context) override {
     const Tensor& diagonal = context->input(0);
     const int num_dims = diagonal.dims();
-    OP_REQUIRES(context, 0 != num_dims, errors::InvalidArgument(
-        "Input must be at least rank 1, got 0"));
+    OP_REQUIRES(
+        context, 0 != num_dims,
+        absl::InvalidArgumentError("Input must be at least rank 1, got 0"));
     TensorShape out_shape;
     for (int i = 0; i < num_dims; ++i) {
-      out_shape.AddDim(diagonal.dim_size(i));
+      OP_REQUIRES_OK(context, out_shape.AddDimWithStatus(diagonal.dim_size(i)));
     }
     for (int i = 0; i < num_dims; ++i) {
-      out_shape.AddDim(diagonal.dim_size(i));
+      OP_REQUIRES_OK(context, out_shape.AddDimWithStatus(diagonal.dim_size(i)));
     }
     Tensor* output_tensor = nullptr;
     OP_REQUIRES_OK(context,
                    context->allocate_output(0, out_shape, &output_tensor));
     functor::DiagFunctor<Device, T> diagFunc;
-    Status s = diagFunc(context,
-                        diagonal.NumElements(),
-                        diagonal.flat<T>().data(),
-                        output_tensor->flat<T>().data());
+    absl::Status s =
+        diagFunc(context, diagonal.NumElements(), diagonal.flat<T>().data(),
+                 output_tensor->flat<T>().data());
     OP_REQUIRES_OK(context, s);
   }
 };
@@ -79,36 +79,35 @@ class DiagPartOp : public OpKernel {
     const int num_dims = tensor.dims();
     const int out_dims = num_dims / 2;
     OP_REQUIRES(context, 0 == num_dims % 2,
-                errors::InvalidArgument("The rank of the tensor should be \
+                absl::InvalidArgumentError(
+                    absl::StrCat("The rank of the tensor should be \
                                          even and positive, got shape ",
-                                        tensor.shape().DebugString()));
-    for (int i = 0; i < out_dims; i++){
-      OP_REQUIRES(context, tensor.dim_size(i) == tensor.dim_size(i + out_dims),
-                  errors::InvalidArgument(
-                    "Invalid shape ", tensor.shape().DebugString(),
-                    ": dimensions ", i, " and ", i + out_dims, " do not match.")
-                  );
+                                 tensor.shape().DebugString())));
+    for (int i = 0; i < out_dims; i++) {
+      OP_REQUIRES(
+          context, tensor.dim_size(i) == tensor.dim_size(i + out_dims),
+          absl::InvalidArgumentError(absl::StrCat(
+              "Invalid shape ", tensor.shape().DebugString(), ": dimensions ",
+              i, " and ", i + out_dims, " do not match.")));
     }
 
     TensorShape out_shape;
     for (int i = 0; i < out_dims; ++i) {
-      out_shape.AddDim(tensor.dim_size(i));
+      OP_REQUIRES_OK(context, out_shape.AddDimWithStatus(tensor.dim_size(i)));
     }
 
     Tensor* output = nullptr;
-    OP_REQUIRES_OK(context,
-                   context->allocate_output(0, out_shape, &output));
+    OP_REQUIRES_OK(context, context->allocate_output(0, out_shape, &output));
     functor::DiagPartFunctor<Device, T> diagPartFunc;
-    Status s = diagPartFunc(context,
-                            out_shape.num_elements(),
-                            tensor.flat<T>().data(),
-                            output->flat<T>().data());
+    absl::Status s =
+        diagPartFunc(context, out_shape.num_elements(), tensor.flat<T>().data(),
+                     output->flat<T>().data());
     OP_REQUIRES_OK(context, s);
   }
 };
 
 // Implementation of the functor specialization for CPU.
-// 
+//
 // According to the diagonal definition,
 // `output[i1,..., ik, i1,..., ik] = input[i1,..., ik]`,
 //
@@ -116,7 +115,7 @@ class DiagPartOp : public OpKernel {
 // pointer can be represent by coordinate [i1,..., ik],
 // where `index = i1*(s2*...*sk) + i2*(s3*...*sk) +... + ik`
 //
-// Let new_index is the offset of output's pointer with coordinate 
+// Let new_index is the offset of output's pointer with coordinate
 // [i1,..., ik, i1,..., ik], then we have
 // `new_index = i1*(s2*...sk*s1*...*sk) + i2*(s3*...*sk*s1*...*sk) +... + \
 //              ik*(s1*...*sk) + i1*(s2*...*sk) + i2*(s3*...*sk) +... + ik
@@ -129,48 +128,47 @@ class DiagPartOp : public OpKernel {
 namespace functor {
 template <typename T>
 struct DiagFunctor<CPUDevice, T> {
-  EIGEN_ALWAYS_INLINE Status
-  operator() (OpKernelContext* context, const int64 size,
-              const T* in, T* out) {
+  EIGEN_ALWAYS_INLINE absl::Status operator()(OpKernelContext* context,
+                                              const int64_t size, const T* in,
+                                              T* out) {
     // This subprocess is responsible for writing values in index range
     // [start*size, limit*size)
-    auto subDiag = [in, out, size](int64 start, int64 limit) {
+    auto subDiag = [in, out, size](int64_t start, int64_t limit) {
       std::fill(out + size * start, out + size * limit, T());
-      for (int64 index = start; index < limit; ++index) {
+      for (int64_t index = start; index < limit; ++index) {
         out[(1 + size) * index] = in[index];
       }
     };
 
     // Here, 5 is a empirical factor of cost_per_unit.
     auto worker_threads = *(context->device()->tensorflow_cpu_worker_threads());
-    Shard(worker_threads.num_threads, worker_threads.workers, size,
-        5 * size, subDiag);
-    return Status::OK();
+    Shard(worker_threads.num_threads, worker_threads.workers, size, 5 * size,
+          subDiag);
+    return absl::OkStatus();
   }
 };
 
 template <typename T>
 struct DiagPartFunctor<CPUDevice, T> {
-  EIGEN_ALWAYS_INLINE Status
-  operator() (OpKernelContext* context, const int64 size,
-              const T* in, T* out) {
+  EIGEN_ALWAYS_INLINE absl::Status operator()(OpKernelContext* context,
+                                              const int64_t size, const T* in,
+                                              T* out) {
     // This subprocess is responsible for extracting values in index range
     // [start, limit)
-    auto subDiagPart = [in, out, size](int64 start, int64 limit) {
-      for (int64 index = start; index < limit; ++index) {
+    auto subDiagPart = [in, out, size](int64_t start, int64_t limit) {
+      for (int64_t index = start; index < limit; ++index) {
         out[index] = in[(1 + size) * index];
       }
     };
 
     // Here, 5 is a empirical factor of cost_per_unit.
     auto worker_threads = *(context->device()->tensorflow_cpu_worker_threads());
-    Shard(worker_threads.num_threads, worker_threads.workers, size,
-        5, subDiagPart);
-    return Status::OK();
+    Shard(worker_threads.num_threads, worker_threads.workers, size, 5,
+          subDiagPart);
+    return absl::OkStatus();
   }
 };
 }  // namespace functor
-
 
 // Register the CPU kernels.
 #define REGISTER_DIAGOP(T)                                    \
@@ -182,8 +180,8 @@ TF_CALL_double(REGISTER_DIAGOP);
 TF_CALL_float(REGISTER_DIAGOP);
 TF_CALL_int32(REGISTER_DIAGOP);
 TF_CALL_int64(REGISTER_DIAGOP);
-TF_CALL_complex64(REGISTER_DIAGOP);
-TF_CALL_complex128(REGISTER_DIAGOP);
+TF_CALL_COMPLEX_TYPES(REGISTER_DIAGOP);
+TF_CALL_half(REGISTER_DIAGOP);
 #undef REGISTER_DIAGOP
 
 #define REGISTER_DIAGPARTOP(T)                                    \
@@ -195,19 +193,19 @@ TF_CALL_double(REGISTER_DIAGPARTOP);
 TF_CALL_float(REGISTER_DIAGPARTOP);
 TF_CALL_int32(REGISTER_DIAGPARTOP);
 TF_CALL_int64(REGISTER_DIAGPARTOP);
-TF_CALL_complex64(REGISTER_DIAGPARTOP);
-TF_CALL_complex128(REGISTER_DIAGPARTOP);
+TF_CALL_COMPLEX_TYPES(REGISTER_DIAGPARTOP);
+TF_CALL_half(REGISTER_DIAGPARTOP);
 #undef REGISTER_DIAGPARTOP
 
 // Register the GPU kernels.
-#ifdef GOOGLE_CUDA
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
 // Forward declarations of the functor specializations for GPU.
 namespace functor {
 extern template struct DiagFunctor<GPUDevice, double>;
 extern template struct DiagFunctor<GPUDevice, float>;
-extern template struct DiagFunctor<GPUDevice, int32>;
-extern template struct DiagFunctor<GPUDevice, int64>;
+extern template struct DiagFunctor<GPUDevice, int32_t>;
+extern template struct DiagFunctor<GPUDevice, int64_t>;
 extern template struct DiagFunctor<GPUDevice, complex64>;
 extern template struct DiagFunctor<GPUDevice, complex128>;
 }  // namespace functor
@@ -221,18 +219,19 @@ TF_CALL_double(REGISTER_DIAGOP_GPU);
 TF_CALL_float(REGISTER_DIAGOP_GPU);
 TF_CALL_int32(REGISTER_DIAGOP_GPU);
 TF_CALL_int64(REGISTER_DIAGOP_GPU);
-TF_CALL_complex64(REGISTER_DIAGOP_GPU);
-TF_CALL_complex128(REGISTER_DIAGOP_GPU);
+TF_CALL_COMPLEX_TYPES(REGISTER_DIAGOP_GPU);
+TF_CALL_half(REGISTER_DIAGOP_GPU);
 #undef REGISTER_DIAGOP_GPU
 
 // Forward declarations of the functor specializations for GPU.
 namespace functor {
 extern template struct DiagPartFunctor<GPUDevice, double>;
 extern template struct DiagPartFunctor<GPUDevice, float>;
-extern template struct DiagPartFunctor<GPUDevice, int32>;
-extern template struct DiagPartFunctor<GPUDevice, int64>;
+extern template struct DiagPartFunctor<GPUDevice, int32_t>;
+extern template struct DiagPartFunctor<GPUDevice, int64_t>;
 extern template struct DiagPartFunctor<GPUDevice, complex64>;
 extern template struct DiagPartFunctor<GPUDevice, complex128>;
+extern template struct DiagPartFunctor<GPUDevice, Eigen::half>;
 }  // namespace functor
 
 #define REGISTER_DIAGPARTOP_GPU(T)                                \
@@ -244,12 +243,10 @@ TF_CALL_double(REGISTER_DIAGPARTOP_GPU);
 TF_CALL_float(REGISTER_DIAGPARTOP_GPU);
 TF_CALL_int32(REGISTER_DIAGPARTOP_GPU);
 TF_CALL_int64(REGISTER_DIAGPARTOP_GPU);
-TF_CALL_complex64(REGISTER_DIAGPARTOP_GPU);
-TF_CALL_complex128(REGISTER_DIAGPARTOP_GPU);
+TF_CALL_COMPLEX_TYPES(REGISTER_DIAGPARTOP_GPU);
+TF_CALL_half(REGISTER_DIAGPARTOP_GPU);
 #undef REGISTER_DIAGPARTOP_GPU
 
-#endif  // GOOGLE_CUDA
-
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
 }  // namespace tensorflow
-

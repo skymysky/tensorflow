@@ -14,6 +14,8 @@ limitations under the License.
 ==============================================================================*/
 
 #include "tensorflow/cc/framework/gradient_checker.h"
+
+#include "absl/status/status.h"
 #include "tensorflow/cc/framework/grad_op_registry.h"
 #include "tensorflow/cc/framework/testutil.h"
 #include "tensorflow/cc/ops/standard_ops.h"
@@ -24,9 +26,19 @@ limitations under the License.
 #include "tensorflow/core/util/equal_graph_def.h"
 
 namespace tensorflow {
-using namespace ops;  // NOLINT(build/namespaces)
-
 namespace {
+
+using ops::Complex;
+using ops::Const;
+using ops::Div;
+using ops::MatMul;
+using ops::Placeholder;
+using ops::Real;
+using ops::Split;
+using ops::Square;
+using ops::Stack;
+using ops::Sub;
+using ops::Unstack;
 
 TEST(GradientCheckerTest, BasicFloat) {
   Scope scope = Scope::NewRootScope();
@@ -96,6 +108,20 @@ TEST(GradientCheckerTest, Complex64ToFloat) {
   EXPECT_LT(max_error, 1e-4);
 }
 
+// When calculating gradients that are undefined, test we get NaN
+// as the computed error rather than 0.
+TEST(GradientCheckerTest, BasicNan) {
+  Scope scope = Scope::NewRootScope();
+  TensorShape shape({2, 4, 3});
+  auto x = Placeholder(scope, DT_FLOAT, Placeholder::Shape(shape));
+  // y = x/(x-x) should always return NaN
+  auto y = Div(scope, x, Sub(scope, x, x));
+  float max_error;
+  TF_ASSERT_OK((ComputeGradientError<float, float, float>(
+      scope, {x}, {shape}, {y}, {shape}, &max_error)));
+  EXPECT_TRUE(std::isnan(max_error));
+}
+
 TEST(GradientCheckerTest, MatMulGrad) {
   Scope scope = Scope::NewRootScope();
 
@@ -156,6 +182,24 @@ TEST(GradientCheckerTest, StackUnstackGrad) {
   TF_ASSERT_OK((ComputeGradientError<double, double, double>(
       scope, xs, {shape, shape}, y.output, {shape, shape}, &max_error)));
   EXPECT_LT(max_error, 1e-10);
+}
+
+TEST(GradientCheckerTest, ShapeMismatchError) {
+  Scope scope = Scope::NewRootScope();
+  auto x = Placeholder(scope, DT_FLOAT);
+  auto y = ops::Concat(scope, std::vector<Output>{x, x}, ops::Const(scope, 0));
+
+  TensorShape x_shape({1});
+  TensorShape y_shape({4});  // Intentionally wrong, evaluate returns 2.
+
+  float max_error;
+  auto status = ComputeGradientError<float, float, float>(
+      scope, {x}, {x_shape}, {y}, {y_shape}, &max_error);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_NE(
+      std::string(status.message()).find("expected shape [4] but was [2]"),
+      std::string::npos);
 }
 
 }  // namespace

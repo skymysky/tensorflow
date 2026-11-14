@@ -15,106 +15,73 @@ limitations under the License.
 
 #include "tensorflow/compiler/tf2xla/xla_jit_compiled_cpu_function.h"
 
+#include <cstddef>
 #include <memory>
+#include <optional>
+#include <utility>
 #include <vector>
 
+#include "absl/status/status.h"
+#include "absl/types/span.h"
 #include "tensorflow/compiler/tf2xla/tf2xla.h"
 #include "tensorflow/compiler/tf2xla/tf2xla.pb.h"
 #include "tensorflow/compiler/tf2xla/xla_compiled_cpu_function.h"
-#include "tensorflow/compiler/xla/client/client_library.h"
-#include "tensorflow/compiler/xla/client/local_client.h"
-#include "tensorflow/compiler/xla/service/cpu/cpu_executable.h"
-#include "tensorflow/compiler/xla/shape_util.h"
-#include "tensorflow/compiler/xla/xla_data.pb.h"
+#include "xla/backends/cpu/buffer_allocation_info.h"
+#include "xla/backends/cpu/buffer_allocation_info_util.h"
+#include "xla/backends/cpu/codegen/compiled_function_library.h"
+#include "xla/client/client_library.h"
+#include "xla/client/executable_build_options.h"
+#include "xla/client/local_client.h"
+#include "xla/hlo/builder/xla_computation.h"
+#include "xla/service/cpu/cpu_aot_compilation_result.h"
+#include "xla/service/cpu/cpu_executable.h"
+#include "xla/service/platform_util.h"
+#include "xla/shape_util.h"
+#include "xla/stream_executor/platform.h"
+#include "xla/xla_data.pb.h"
 #include "tensorflow/core/framework/graph.pb.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/platform/errors.h"
 #include "tensorflow/core/platform/macros.h"
 #include "tensorflow/core/platform/types.h"
+#include "tsl/platform/casts.h"
+#include "tsl/platform/statusor.h"
 
 namespace tensorflow {
 
 namespace {
-
-// Returns a vector of positional argument buffer sizes.
-xla::StatusOr<std::vector<intptr_t>> ComputeArgSizes(
-    const xla::ProgramShape& program_shape, bool requires_runtime_context) {
-  std::vector<intptr_t> arg_sizes;
-  const size_t num_args = program_shape.parameters_size();
-  arg_sizes.reserve(num_args);
-  for (int i = 0; i < num_args; ++i) {
-    const xla::Shape& arg_shape = program_shape.parameters(i);
-    if (i == num_args - 1 && requires_runtime_context) {
-      // If the compiled function needs an XlaLocalRuntimeContext* arg, it's
-      // always last, and must be represented as an opaque type.
-      const xla::PrimitiveType type = arg_shape.element_type();
-      if (type != xla::OPAQUE) {
-        return errors::InvalidArgument(
-            "expected final context arg to be opaque, but got type: ",
-            xla::PrimitiveType_Name(type), ", from program shape: ",
-            xla::ShapeUtil::HumanString(program_shape));
-      }
-      arg_sizes.push_back(-1);
-    } else {
-      constexpr size_t kPointerSize = sizeof(void*);
-      arg_sizes.push_back(xla::ShapeUtil::ByteSizeOf(arg_shape, kPointerSize));
-    }
-  }
-  return std::move(arg_sizes);
-}
-
-// Returns a vector of positional temporary buffer sizes.
-xla::StatusOr<std::vector<intptr_t>> ComputeTempSizes(
-    const xla::BufferAssignment& buffer_assignment) {
-  const std::vector<xla::BufferAllocation>& allocations =
-      buffer_assignment.Allocations();
-  std::vector<intptr_t> temp_sizes;
-  temp_sizes.reserve(allocations.size());
-  for (const xla::BufferAllocation& allocation : allocations) {
-    // Callers don't allocate temporary buffers for parameters. Nor for
-    // thread-local buffers, which are lowered to alloca.
-    if (allocation.is_entry_computation_parameter() ||
-        allocation.is_thread_local()) {
-      temp_sizes.push_back(-1);
-    } else {
-      temp_sizes.push_back(allocation.size());
-    }
-  }
-  return std::move(temp_sizes);
-}
+constexpr char kHostPlatform[] = "Host";
 
 // Returns the index of the result in the temp buffers.
-xla::StatusOr<size_t> ComputeResultIndex(
+absl::StatusOr<size_t> ComputeResultIndex(
     const xla::BufferAssignment& buffer_assignment) {
   TF_ASSIGN_OR_RETURN(const xla::BufferAllocation::Slice result_slice,
                       buffer_assignment.GetUniqueTopLevelOutputSlice());
   return result_slice.index();
 }
 
-// Adapt ComputeFunctionType, which includes a final profile_counters arg, to
-// RawFunction, which doesn't include that final arg.
-//
-// TODO(toddw): Change RawFunction and AOT to also pass the final
-// profile_counters arg, and remove this adapter.
-XlaCompiledCpuFunction::RawFunction RawFunctionAdapter(
-    xla::cpu::CpuExecutable::ComputeFunctionType compute_function) {
-  return [compute_function](void* result,
-                            const xla::ExecutableRunOptions* run_options,
-                            const void** args, void** temps) {
-    return compute_function(result, run_options, args, temps,
-                            /*profile_counters=*/nullptr);
-  };
+// Returns the number of results.
+int CountResults(
+    absl::Span<const xla::cpu::BufferAllocationInfo> buffer_infos) {
+  int num_results = 0;
+  for (const auto& info : buffer_infos) {
+    if (info.is_result()) {
+      ++num_results;
+    }
+  }
+  return num_results;
 }
 
-// Collect names from `entries`, where T is one of tf2xla::{Feed,Fetch}. We hold
-// the actual strings in nonempty_names, and hold arrays of pointers in
-// name_ptrs, terminated by a nullptr entry.
+// Collect names from `entries`, where T is one of
+// tf2xla::{Feed,Fetch,Variable}. We hold the actual strings in nonempty_names,
+// and hold arrays of pointers in name_ptrs, terminated by a nullptr entry.
 template <typename T>
-void CollectNames(const T& entries, std::vector<string>* nonempty_names,
+void CollectNames(const T& entries, std::vector<std::string>* nonempty_names,
                   std::vector<const char*>* name_ptrs) {
   // First collect `nonempty_names`, to ensure the underlying strings won't
   // change out from under us.
   for (const auto& entry : entries) {
-    const string& name = entry.name();
+    const std::string& name = entry.name();
     if (!name.empty()) {
       nonempty_names->push_back(name);
     }
@@ -123,7 +90,7 @@ void CollectNames(const T& entries, std::vector<string>* nonempty_names,
   name_ptrs->reserve(entries.size() + 1);  // +1 for nullptr array terminator
   size_t nonempty_index = 0;
   for (const auto& entry : entries) {
-    const string& name = entry.name();
+    const std::string& name = entry.name();
     if (!name.empty()) {
       name_ptrs->push_back(nonempty_names->at(nonempty_index).c_str());
       ++nonempty_index;
@@ -136,17 +103,18 @@ void CollectNames(const T& entries, std::vector<string>* nonempty_names,
 
 }  // namespace
 
-/*static*/ xla::StatusOr<std::unique_ptr<XlaJitCompiledCpuFunction>>
+/*static*/ absl::StatusOr<std::unique_ptr<XlaJitCompiledCpuFunction>>
 XlaJitCompiledCpuFunction::Compile(
     const GraphDef& graph_def, const tf2xla::Config& config,
     const xla::ExecutableBuildOptions& build_options) {
-  // Convert the graph_def into an xla::Computation.
+  // Convert the graph_def into an xla::XlaComputation.
+  TF_ASSIGN_OR_RETURN(se::Platform * platform,
+                      xla::PlatformUtil::GetPlatform(kHostPlatform));
   TF_ASSIGN_OR_RETURN(xla::LocalClient * client,
-                      xla::ClientLibrary::GetOrCreateLocalClient());
-  xla::Computation computation;
-  bool requires_runtime_context;
-  TF_RETURN_IF_ERROR(tensorflow::ConvertGraphDefToXla(
-      graph_def, config, client, &computation, &requires_runtime_context));
+                      xla::ClientLibrary::GetOrCreateLocalClient(platform));
+  xla::XlaComputation computation;
+  TF_RETURN_IF_ERROR(tensorflow::ConvertGraphDefToXla(graph_def, config, client,
+                                                      &computation));
 
   // Get and verify the program shape.
   TF_ASSIGN_OR_RETURN(std::unique_ptr<xla::ProgramShape> program_shape,
@@ -155,7 +123,7 @@ XlaJitCompiledCpuFunction::Compile(
     // The XlaCompiler we use to build the xla computation always generates a
     // tuple result, and XlaCompiledCpuFunction relies on this for simpler
     // calling semantics.
-    return errors::Internal(
+    return absl::InternalError(
         "XlaJitCompiledCpuFunction requires the XLA result to be a tuple");
   }
   // The parameter names are currently meaningless, and redundant with the rest
@@ -172,45 +140,132 @@ XlaJitCompiledCpuFunction::Compile(
   // Compile the executable. The static_cast to the CpuExecutable subclass is
   // necessary since the raw function and buffer assignments are only available
   // there.
-  TF_ASSIGN_OR_RETURN(std::unique_ptr<xla::LocalExecutable> executable,
+  TF_ASSIGN_OR_RETURN(auto executables,
                       client->Compile(computation, arg_shapes, build_options));
-  const xla::cpu::CpuExecutable* cpu_executable =
+  TF_RET_CHECK(executables.size() == 1);
+  std::unique_ptr<xla::LocalExecutable> executable = std::move(executables[0]);
+  xla::cpu::CpuExecutable* cpu_executable =
       static_cast<xla::cpu::CpuExecutable*>(executable->executable());
-  XlaCompiledCpuFunction::RawFunction raw_function =
-      RawFunctionAdapter(cpu_executable->compute_function());
   const xla::BufferAssignment& buffer_assignment =
       cpu_executable->buffer_assignment();
 
-  // Compute buffer sizes and the result index, needed to run the raw function.
-  TF_ASSIGN_OR_RETURN(
-      std::vector<intptr_t> arg_sizes,
-      ComputeArgSizes(*program_shape, requires_runtime_context));
-  TF_ASSIGN_OR_RETURN(std::vector<intptr_t> temp_sizes,
-                      ComputeTempSizes(buffer_assignment));
+  // Compute buffer infos and the result index, needed to run the raw function.
+  std::vector<xla::cpu::BufferAllocationInfo> buffer_infos =
+      xla::cpu::CreateBufferAllocationInfos(cpu_executable->module(),
+                                            buffer_assignment);
+
+  std::vector<xla::cpu::BufferAllocationInfo> buffer_allocation_infos =
+      xla::cpu::CreateBufferAllocationInfos(cpu_executable->module(),
+                                            buffer_assignment);
+
+  std::vector<int32_t> arg_index_table =
+      xla::cpu::CreateArgIndexTable(buffer_infos);
+  std::vector<int32_t> result_index_table =
+      xla::cpu::CreateResultIndexTable(buffer_infos);
   TF_ASSIGN_OR_RETURN(size_t result_index,
                       ComputeResultIndex(buffer_assignment));
+  const int num_results = CountResults(buffer_infos);
 
   std::unique_ptr<XlaJitCompiledCpuFunction> jit_unique_ptr(
       new XlaJitCompiledCpuFunction);
+
   XlaJitCompiledCpuFunction* jit = jit_unique_ptr.get();
+
+  if (!cpu_executable->has_thunks()) {
+    return absl::InternalError(
+        "JIT compilation supports only thunk execution.");
+  }
+
+  {
+    // This is here for simplicity, effectively just used to get the thunk
+    // information to the XlaCompiledCpuFunction.
+    TF_ASSIGN_OR_RETURN(
+        auto compilation_result,
+        xla::cpu::CpuAotCompilationResult::Create(
+            &cpu_executable->module(), &cpu_executable->buffer_assignment(),
+            cpu_executable->module_name(),
+            // Symbols and object files are not needed since the function
+            // library will be backed by the one in the executable which is
+            // owned by XlaJitCompiledCpuFunction.
+            /*obj_files=*/{}, /*symbols=*/{},
+            cpu_executable->thunks().thunk_sequence(),
+            /*function_library=*/nullptr));
+
+    const std::optional<size_t> temp_allocation_index =
+        compilation_result->temp_allocation_index();
+
+    XlaCompiledCpuFunction::set_static_data_temp_allocation_index(
+        &jit->static_data_, temp_allocation_index);
+
+    jit->compilation_result_proto_ =
+        std::make_unique<xla::cpu::CompilationResultProto>(
+            compilation_result->proto());
+
+    auto compiled_function_library =
+        absl::down_cast<xla::cpu::CompiledFunctionLibrary*>(
+            cpu_executable->function_library());
+
+    if (!compiled_function_library) {
+      return absl::InternalError(
+          "Could not downcast FunctionLibrary to CompiledFunctionLibrary");
+    }
+
+    // NOTE: This will work because the function library is by the
+    // executable and keeps the function pointers alive.
+    jit->function_library_symbol_map_ =
+        compiled_function_library->GetTypelessSymbolsMap();
+  }
+
   jit->executable_ = std::move(executable);
-  jit->arg_sizes_ = std::move(arg_sizes);
-  jit->temp_sizes_ = std::move(temp_sizes);
-  jit->program_shape_ = std::move(program_shape);
-  jit->static_data_.raw_function = std::move(raw_function);
-  jit->static_data_.arg_sizes = jit->arg_sizes_.data();
-  jit->static_data_.num_args = jit->arg_sizes_.size();
-  jit->static_data_.temp_sizes = jit->temp_sizes_.data();
-  jit->static_data_.num_temps = jit->temp_sizes_.size();
-  jit->static_data_.result_index = result_index;
-  jit->static_data_.requires_runtime_context = requires_runtime_context;
+  jit->buffer_infos_ = std::move(buffer_infos);
+  jit->arg_index_table_ = std::move(arg_index_table);
+  jit->result_index_table_ = std::move(result_index_table);
+  jit->program_shape_ =
+      std::make_unique<xla::ProgramShapeProto>(program_shape->ToProto());
+  XlaCompiledCpuFunction::set_static_data_compilation_result_proto(
+      &jit->static_data_, jit->compilation_result_proto_.get());
+  XlaCompiledCpuFunction::set_static_data_function_library_symbol_map(
+      &jit->static_data_, jit->function_library_symbol_map_);
+
+  XlaCompiledCpuFunction::set_static_data_buffer_infos(
+      &jit->static_data_, jit->buffer_infos_.data());
+  XlaCompiledCpuFunction::set_static_data_num_buffers(
+      &jit->static_data_, jit->buffer_infos_.size());
+  XlaCompiledCpuFunction::set_static_data_arg_index_table(
+      &jit->static_data_, jit->arg_index_table_.data());
+  XlaCompiledCpuFunction::set_static_data_result_index_table(
+      &jit->static_data_, jit->result_index_table_.data());
+  XlaCompiledCpuFunction::set_static_data_num_args(
+      &jit->static_data_, jit->arg_index_table_.size());
+  XlaCompiledCpuFunction::set_static_data_num_variables(&jit->static_data_,
+                                                        config.variable_size());
+  XlaCompiledCpuFunction::set_static_data_num_results(&jit->static_data_,
+                                                      num_results);
+  XlaCompiledCpuFunction::set_static_data_result_index(&jit->static_data_,
+                                                       result_index);
   // Optional metadata is collected and set below.
   CollectNames(config.feed(), &jit->nonempty_arg_names_, &jit->arg_names_);
+
+  auto variable_copy = config.variable();
+  for (auto& var : variable_copy) {
+    if (var.name().empty()) {
+      var.set_name(var.node_name());
+    }
+  }
+  CollectNames(variable_copy, &jit->nonempty_variable_names_,
+               &jit->variable_names_);
+
   CollectNames(config.fetch(), &jit->nonempty_result_names_,
                &jit->result_names_);
-  jit->static_data_.arg_names = jit->arg_names_.data();
-  jit->static_data_.result_names = jit->result_names_.data();
-  jit->static_data_.program_shape = jit->program_shape_.get();
+  XlaCompiledCpuFunction::set_static_data_arg_names(&jit->static_data_,
+                                                    jit->arg_names_.data());
+  XlaCompiledCpuFunction::set_static_data_variable_names(
+      &jit->static_data_, jit->variable_names_.data());
+  XlaCompiledCpuFunction::set_static_data_result_names(
+      &jit->static_data_, jit->result_names_.data());
+  XlaCompiledCpuFunction::set_static_data_program_shape(
+      &jit->static_data_, jit->program_shape_.get());
+
   return std::move(jit_unique_ptr);
 }
 

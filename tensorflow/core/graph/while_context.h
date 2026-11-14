@@ -13,8 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef TENSORFLOW_GRAPH_WHILE_CONTEXT_H_
-#define TENSORFLOW_GRAPH_WHILE_CONTEXT_H_
+#ifndef TENSORFLOW_CORE_GRAPH_WHILE_CONTEXT_H_
+#define TENSORFLOW_CORE_GRAPH_WHILE_CONTEXT_H_
 
 #include "tensorflow/core/graph/graph.h"
 
@@ -31,15 +31,15 @@ namespace tensorflow {
 // future to support these features.
 //
 // TODO(skyewm): de/serialize in MetaGraphDef so imported while loops will be
-// differentiable. Figure out backwards compatability story.
+// differentiable. Figure out backwards compatibility story.
 class WhileContext {
  public:
-  WhileContext(StringPiece frame_name, std::vector<Node*> enter_nodes,
+  WhileContext(absl::string_view frame_name, std::vector<Node*> enter_nodes,
                std::vector<Node*> exit_nodes, OutputTensor cond_output,
                std::vector<OutputTensor> body_inputs,
                std::vector<OutputTensor> body_outputs);
 
-  const string& frame_name() const { return frame_name_; }
+  const std::string& frame_name() const { return frame_name_; }
   const std::vector<Node*>& enter_nodes() const { return enter_nodes_; }
   const std::vector<Node*>& exit_nodes() const { return exit_nodes_; }
   const OutputTensor& cond_output() const { return cond_output_; }
@@ -53,7 +53,7 @@ class WhileContext {
   // uniquely identified by its frame name. Frames are used by the executor to
   // manage the iterations of a loop. See the FrameState comment in
   // core/common_runtime/executor.cc for more details.
-  const string frame_name_;
+  const std::string frame_name_;
 
   // The enter nodes defining the input loop variables to the while loop. This
   // vector defines the order of the loop variables.
@@ -73,4 +73,4 @@ class WhileContext {
 
 }  // namespace tensorflow
 
-#endif  // TENSORFLOW_GRAPH_GRAPH_H_
+#endif  // TENSORFLOW_CORE_GRAPH_WHILE_CONTEXT_H_

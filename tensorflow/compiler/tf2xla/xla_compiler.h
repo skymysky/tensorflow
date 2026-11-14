@@ -16,25 +16,65 @@ limitations under the License.
 #ifndef TENSORFLOW_COMPILER_TF2XLA_XLA_COMPILER_H_
 #define TENSORFLOW_COMPILER_TF2XLA_XLA_COMPILER_H_
 
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <memory>
+#include <optional>
+#include <stack>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include "absl/base/thread_annotations.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
+#include "absl/synchronization/mutex.h"
+#include "absl/types/span.h"
+#include "tensorflow/compiler/tf2xla/host_compute_metadata.pb.h"
+#include "tensorflow/compiler/tf2xla/layout_util.h"
+#include "tensorflow/compiler/tf2xla/xla_argument.h"
 #include "tensorflow/compiler/tf2xla/xla_compilation_device.h"
-#include "tensorflow/compiler/xla/client/local_client.h"
+#include "tensorflow/compiler/tf2xla/xla_expression.h"
+#include "tensorflow/compiler/tf2xla/xla_helpers.h"
+#include "tensorflow/compiler/tf2xla/xla_op_registry.h"
+#include "tensorflow/compiler/tf2xla/xla_resource.h"
+#include "xla/client/client.h"
+#include "xla/client/local_client.h"
+#include "xla/hlo/builder/xla_builder.h"
+#include "xla/hlo/builder/xla_computation.h"
+#include "xla/hlo/ir/hlo_sharding.h"
+#include "xla/shape.h"
+#include "xla/status_macros.h"
+#include "xla/stream_executor/device_memory_allocator.h"
 #include "tensorflow/core/common_runtime/device.h"
 #include "tensorflow/core/common_runtime/device_mgr.h"
 #include "tensorflow/core/common_runtime/function.h"
 #include "tensorflow/core/framework/function.h"
+#include "tensorflow/core/framework/op_kernel.h"
+#include "tensorflow/core/framework/tensor_shape.h"
+#include "tensorflow/core/framework/types.h"
+#include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/platform/env.h"
 #include "tensorflow/core/platform/mutex.h"
 #include "tensorflow/core/platform/notification.h"
 #include "tensorflow/core/platform/thread_annotations.h"
+#include "tensorflow/core/platform/types.h"
+#include "tensorflow/core/protobuf/config.pb.h"
 #include "tensorflow/core/public/version.h"
 
 namespace tensorflow {
+
+class XlaContext;
+
 // The XlaCompiler class is responsible for compilation of a self-contained
 // subgraph of a TensorFlow computation using the XLA linear algebra runtime.
 // It does a symbolic execution of the graph starting from specific input
 // shapes, using a JIT device to convert operators into XLA computations.
 //
-// XlaCompiler is typically invoked from an `_XlaLaunch` operator once the
+// XlaCompiler is typically invoked from an `XlaLaunch` operator once the
 // shapes of all input parameters to the computation are known. This is
 // because the symbolic execution requires known shapes for all operations.
 //
@@ -47,15 +87,7 @@ namespace tensorflow {
 // (kind kResource).
 //
 // Only kParameter and initialized kResource arguments become runtime parameters
-// to the generated XLA computation. The XLA computation will have run-time
-// parameters in the following order:
-//   +---------------------+-----------------------------------------+
-//   |  kParameter values  |  Initial values of kResource arguments  |
-//   +---------------------+-----------------------------------------+
-// Within each block, the arguments are arranged by the _Arg index from which
-// they were derived.
-// If `Options::requires_runtime_context` is true, then an additional runtime
-// context argument is passed as a final argument.
+// to the generated XLA computation.
 //
 // The run-time outputs of the XLA computation are arranged in the following
 // order:
@@ -65,10 +97,19 @@ namespace tensorflow {
 // _Retval values are ordered by _Retval index, whereas kResource values are
 // ordered by the original _Arg position of the variable.
 //
-// In both inputs and outputs, kResource values are placed the end. When
+// If a shape representation function is provided as part of
+// XlaCompiler::CompileOptions, kParameter arguments and return values to an
+// entry computation will be reshaped in accordance to the shape function.
+// Arguments and return values to a non-entry computation are not reshaped.
+// Variable resource arguments are passed and returned in reshaped form, even
+// for non-entry computations. This feature allows TensorFlow to keep on-device
+// tensors with a different shape to their representation inside the XLA
+// computation.
+//
+// In computation outputs, updated kResource values are placed the end. When
 // emitting While loop bodies, we must ensure that the loop body has
-// identical input and output signatures. By moving variable values
-// to the end of the argument list and using the
+// identical input and output signatures. By passing variable values
+// at the end of the argument list and using the
 // `return_updated_values_for_all_variables` option, we can ensure that the
 // input and output values of resources appear at the same positions.
 //
@@ -82,58 +123,9 @@ namespace tensorflow {
 // `tensor_array_gradients` ordered set.
 class XlaCompiler {
  public:
-  // Describes how to derive the value of each _Arg node in the graph/function
-  // being compiled. There must be one Argument for each _Arg index.
-  struct Argument {
-    enum Kind {
-      // Default value; not a valid kind.
-      kInvalid,
-
-      // Argument is a compile-time constant. No associated runtime parameter.
-      kConstant,
-
-      // Argument is a Variable, TensorArray, or Stack resource. Has an
-      // associated runtime parameter iff `initialized` is true.
-      kResource,
-
-      // Argument is a run-time parameter.
-      kParameter,
-    };
-
-    Kind kind = kInvalid;
-
-    // The type of the argument. If the argument is a resource, this
-    // is the type of the variable's value, not DT_RESOURCE.
-    DataType type;
-
-    // The shape of the argument. If the argument is a resource, this is the
-    // shape of the resource's value.
-    xla::Shape shape;
-
-    // The value of the argument, if it is a compile-time constant. Must be a
-    // host-memory tensor.
-    Tensor constant_value;
-
-    // The name of this argument, used for debugging.
-    string name;
-
-    // For a kResource, what kind of resource is it?
-    XlaResource::Kind resource_kind = XlaResource::kInvalid;
-
-    // For a kResource, has this resource been initialized?
-    bool initialized = false;
-
-    // For a TensorArray or Stack resource, what is the array's declared size?
-    // (Used for lazy initialization.)
-    int64 tensor_array_size = -1;
-
-    // TensorArray resource parameters are passed as (array, gradient array 0,
-    // ..., gradient array k), where the gradient arrays are in the same order
-    // as `tensor_array_gradients`.
-    std::set<string> tensor_array_gradients;
-
-    bool operator==(const Argument& other) const;
-  };
+  // TODO(b/255826209): Remove this alias. Depending on XlaCompiler just to use
+  // XlaArgument seeems weird and can cause circular dependencies.
+  using Argument = ::tensorflow::XlaArgument;
 
   // Options pertaining to an individual call to CompileGraph() or
   // CompileFunction().
@@ -149,79 +141,49 @@ class XlaCompiler {
     // the input and output signatures match.
     bool return_updated_values_for_all_resources = false;
 
-    // If 'resolve_compile_time_constants' is true, then outputs of a
-    // computation that are known to be compile-time constants will be returned
-    // as Tensors at compile-time, rather than as run-time outputs of the
-    // computation.
-    bool resolve_compile_time_constants = true;
+    // If 'always_return_tuple' is true, then the output of a computation will
+    // always be a tuple. Otherwise, a single-element output will not be wrapped
+    // in a tuple.
+    bool always_return_tuple = true;
+
+    // True when compiling the entry computation, false for subcomputations
+    // (while, call, etc.)
+    bool is_entry_computation = true;
+
+    // True when we should add XLA input & output to the graph/function.
+    bool add_token_input_output = false;
+
+    // Resource updates are converted into input / output of xla. The two
+    // buffers are aliased with other if this option is true.
+    bool alias_resource_update = false;
+
+    std::string DebugString() const {
+      return absl::StrCat("use_tuple_arg=", use_tuple_arg,
+                          " return_updated_values_for_all_resources=",
+                          return_updated_values_for_all_resources,
+                          " always_return_tuple=", always_return_tuple,
+                          " is_entry_computation=", is_entry_computation,
+                          " add_token_input_output=", add_token_input_output,
+                          " alias_resource_update=", alias_resource_update);
+    }
   };
 
-  struct OutputDescription {
-    // Type and shape of the output.
-    DataType type;
-    TensorShape shape;
+  using OutputDescription = ::tensorflow::XlaOutputDescription;
 
-    // Constant output value, if known to be constant at JIT compilation time.
-    // 'Tensor' is in host memory.
-    bool is_constant = false;
-    Tensor constant_value;
-  };
+  using ResourceUpdate = ::tensorflow::XlaResourceUpdate;
 
-  // Describes a variable write side effect of the computation.
-  struct ResourceUpdate {
-    // Index of the input that contains the variable resource to write to.
-    int input_index;
-
-    // Type and shape of the tensor to be written back.
-    DataType type;
-    xla::Shape shape;
-
-    // Was the value of the variable modified by the computation?
-    // (Always true, unless `return_updated_values_for_all_resources` is true.)
-    bool modified;
-
-    // If the resource is a TensorArray, the set of gradients read or written.
-    std::set<string> tensor_array_gradients_accessed;
-  };
-
-  struct CompilationResult {
-    // Vector that maps from the parameters of the XLA computation to their
-    // original argument positions. To handle compile-time constant inputs and
-    // resources, the parameters to the XLA computation may be a subset of the
-    // original arguments, and are not necessarily in the same order.)
-    std::vector<int> input_mapping;
-
-    // Does the computation require the local runtime context to be passed as
-    // the last argument?
-    bool requires_runtime_context = false;
-
-    // Input shapes of the computation.
-    std::vector<xla::Shape> xla_input_shapes;
-
-    // Should the arguments be packed into a single tuple?
-    bool tuple_arg;
-
-    // Output shape in XLA format. The output shape is always a tuple.
-    xla::Shape xla_output_shape;
-
-    // TensorFlow shapes of outputs, together with the values of any
-    // constant arguments. Vector indexed by Tensorflow _Retval number,
-    // containing both constant and non-constant results.
-    std::vector<OutputDescription> outputs;
-
-    // Resources whose values were updated by the computation, ordered
-    // by return value position. Resource updates follow the non-constant
-    // results in the outputs of XLA computation.
-    std::vector<ResourceUpdate> resource_updates;
-
-    // The XLA computation built from the tensorflow subgraph.
-    std::shared_ptr<xla::Computation> computation;
-  };
+  using CompilationResult = ::tensorflow::XlaCompilationResult;
 
   struct Options {
-    // Name of the compilation device to use. Needs to be live only during
-    // XlaCompiler's constructor.
-    const DeviceType* device_type = nullptr;
+    // Name of the compilation device to use. It must be set by the caller.
+    // The default empty value is invalid.
+    DeviceType device_type = DeviceType("");
+
+    // The device to use during compilation to execute instructions on, for
+    // example for auto-tuning.
+    // Valid values are defined by `xla::Backend::devices_ordinal_supported()`.
+    // -1 indicates the default device should be used.
+    int device_ordinal = -1;
 
     xla::Client* client = nullptr;
 
@@ -232,64 +194,185 @@ class XlaCompiler {
     int graph_def_version = TF_GRAPH_DEF_VERSION;
 
     // If 'allow_cpu_custom_calls' is true, kernels may make use of CustomCall()
-    // for CPU; additionally, an optional XlaLocalRuntimeContext* may be passed
-    // to the computation.
+    // for CPU.
     bool allow_cpu_custom_calls = false;
 
-    // If 'local_executable_has_hybrid_result', the top-level pointers of the
-    // result tuple of compiled programs are stored in host memory and the
-    // nested buffers in device memory, otherwise the whole result tuple is
-    // stored in device memory.
-    bool local_executable_has_hybrid_result = false;
+    // A ShapeDeterminationFns (i.e., a bundle of LayoutSelectionFn and
+    // ShapeRepresentationFn). Each bundle describes the XLA representation of
+    // arguments represented to XLA as the shape given by this shape function.
+    // Arguments are input activations or weights to an XLA entry computation.
+    // Variables are reshaped to this shape on write, and reshaped to their
+    // original shape on read.
+    XlaShapeLayoutHelpers::ShapeDeterminationFns shape_determination_fns;
 
     // If not nullptr, populate_resource_manager is called with the
     // compilation device's resource manager when the compilation
     // device is created, and can be used to create metadata objects
     // that can be accessed by XLA op kernels.
-    std::function<Status(ResourceMgr*)>* populate_resource_manager = nullptr;
+    std::function<absl::Status(ResourceMgr*)>* populate_resource_manager =
+        nullptr;
+
+    // If not nullptr, this memory allocator can be used by the compiler for
+    // temporary allocations it might want to make during compilation.
+    //
+    // For example, the compiler may want to try out different algorithms and
+    // choose the fastest one, and it might run those algorithms over buffers
+    // created using this allocator.
+    //
+    // The compiler can function correctly without an explicit allocator given
+    // here, but on some devices (notably, GPUs), TensorFlow tends to eagerly
+    // allocate most or all available memory on the device, leaving none for the
+    // compiler to access, unless it can use TensorFlow's allocator.
+    // This must be a shared_ptr, as this is passed all the way down to the
+    // cluster compilation. This allows asynchronous compilation to hold a
+    // reference until the compilation is finished.
+    std::shared_ptr<stream_executor::DeviceAddressAllocator> device_allocator;
+
+    // Alias input and output buffers for parameters that are passed-through XLA
+    // modules without being changed.
+    bool alias_passthrough_params = false;
+
+    // Enable detailed logging of compilation metadata.
+    bool detailed_logging = true;
+
+    // If true, use Shardy (go/shardy) partitioner. If false, use GSPMD.
+    bool use_shardy_partitioner = false;
+  };
+
+  // Argument for compiling a single op.
+  struct SingleOpCompileArgument {
+    // Data type of the output tensors. This is used to create _Retval node.
+    std::vector<DataType> output_dtypes;
+
+    // The NodeDef representing the op.
+    NodeDef node_def;
+
+    // This is currently only used to obtain MLIR TPU bridge rollout state.
+    // Can be removed once full rollout is complete.
+    ConfigProto config_proto;
+
+    SingleOpCompileArgument() = default;
+
+    explicit SingleOpCompileArgument(const OpKernelContext& ctx);
   };
 
   explicit XlaCompiler(Options options);
 
   ~XlaCompiler();
 
-  Status CompileFunction(const CompileOptions& options,
-                         const NameAttrList& fn_name_attrs,
-                         const std::vector<Argument>& args,
-                         CompilationResult* result);
+  // Helper function to populate an XlaCompiler::Argument from XlaResource.
+  static void PopulateArgumentFromResource(const XlaResource& resource,
+                                           Argument* arg);
 
-  // Compiles a tensorflow::Graph into an xla::Computation.
+  absl::Status CompileFunction(const CompileOptions& options,
+                               const NameAttrList& fn_name_attrs,
+                               absl::Span<const Argument> args,
+                               CompilationResult* result);
+
+  absl::Status CompileSingleOp(
+      const CompileOptions& options,
+      const SingleOpCompileArgument& single_op_compile_argument,
+      absl::Span<const Argument> args, CompilationResult* result);
+
+  // Compiles a tensorflow::Graph into an xla::XlaComputation.
   // Similar to CompileFunction, but takes a Graph as input rather than a
   // function.
-  Status CompileGraph(const CompileOptions& options, string const& name,
-                      std::unique_ptr<Graph> graph,
-                      const std::vector<Argument>& args,
-                      CompilationResult* result);
+  absl::Status CompileGraph(const CompileOptions& options,
+                            const std::string& name,
+                            std::unique_ptr<Graph> graph,
+                            absl::Span<const Argument> args,
+                            CompilationResult* result);
 
-  Status PrepareArguments(xla::ComputationBuilder* builder, NameAttrList func,
-                          const std::vector<DataType>& types,
-                          const std::vector<TensorShape>& shapes,
-                          const std::vector<const XlaExpression*>& expressions,
-                          std::vector<Argument>* args);
+  // Returns the shape of the XLA parameter for an argument 'arg'.
+  // See the class comment for more details about the argument passing
+  // convention.
+  absl::Status XLAShapeForArgument(
+      const Argument& arg, bool is_entry_computation,
+      const std::optional<xla::HloSharding>& arg_sharding,
+      xla::Shape* xla_shape) const;
 
   // Retrieves the channel handle associated with `key`. Allocates
   // a new channel handle if none exists.
   // Channel handles can be used to communicate between different
   // computations. Computations that communicate should be compiled with the
   // same XlaCompiler.
-  Status GetChannelHandle(const string& key, xla::ChannelHandle* channel);
+  absl::Status GetChannelHandle(const std::string& key,
+                                xla::ChannelHandle* channel);
+
+  // Retrieves the host-to-device channel handle associated with `key`.
+  // Allocates a new channel handle if none exists.
+  absl::Status GetHostToDeviceChannelHandle(const std::string& key,
+                                            xla::ChannelHandle* channel);
+
+  // Retrieves the device-to-host channel handle associated with `key`.
+  // Allocates a new channel handle if none exists.
+  absl::Status GetDeviceToHostChannelHandle(const std::string& key,
+                                            xla::ChannelHandle* channel);
+
+  // Sets the shapes and types for the device to host transfer associated with
+  // 'key'.
+  absl::Status SetDeviceToHostMetadata(const std::string& key,
+                                       absl::Span<const DataType> types,
+                                       absl::Span<const TensorShape> shapes);
+
+  // Gets the shapes the device to host transfer associated with 'key'.
+  absl::Status GetDeviceToHostShapes(const std::string& key,
+                                     std::vector<TensorShape>* shapes) const;
+
+  // Sets the shapes and types for the host to device transfer associated with
+  // 'key'.
+  absl::Status SetHostToDeviceMetadata(const std::string& key,
+                                       absl::Span<const DataType> types,
+                                       absl::Span<const TensorShape> shapes);
+
+  // In order to avoid deadlocks from dependencies in host computations, it can
+  // be necessary to enforce a partial order on the execution of HostCompute
+  // Ops. In particular it may be necessary to constrain the SendToHost for one
+  // HostCompute to run before blocking on the RecvAtHost for another
+  // HostCompute. The compiler maintains a mapping from 'host_compute_name' to
+  // handle, where the handle is an 'output' of the HostCompute Op corresponding
+  // to 'host_compute_name'. Another HostCompute Op that needs to be sequenced
+  // later can add the handle as an 'input' to enforce the constraints.
+  // 'host_compute_name' can be any string the client wishes to use to identify
+  // a given HostCompute Op as long as the names are unique within the
+  // compilation.
+  absl::Status GetHostComputeControlDependency(
+      const std::string& host_compute_name, xla::XlaOp* handle);
+  absl::Status SetHostComputeControlDependency(
+      const std::string& host_compute_name, xla::XlaOp handle);
 
   const Options& options() const { return options_; }
   xla::Client* client() const { return options_.client; }
   FunctionLibraryRuntime* flib_runtime() const { return flib_runtime_; }
 
- private:
-  // Sets the function body `fbody` to the one registered as `function`.
-  Status FindFunctionBody(const NameAttrList& function,
-                          const FunctionBody** fbody);
+  void PushNodeTokenMapping();
+  absl::Status PopNodeTokenMapping();
+  absl::Status SetNodeToken(const std::string& node_name, xla::XlaOp op);
+  absl::StatusOr<xla::XlaOp> GetNodeToken(const std::string& node_name);
 
+  // Sets the function body `fbody` to the one registered as `function`.
+  absl::Status FindFunctionBody(const NameAttrList& function,
+                                const FunctionBody** fbody,
+                                const ConfigProto** config_proto = nullptr);
+
+ private:
+  absl::Mutex channel_mutex_;
   // Returns the optimized graph object in this function body.
   std::unique_ptr<Graph> GetGraph(const FunctionBody* fbody);
+
+  // Builds XLA computations for each of the arguments to the computation.
+  // `args` are the arguments to the computation. Populates
+  // `args_tuple_sdy_sharding` with corresponding shardy sharding if
+  // `use_tuple_arg` is true.
+  absl::Status BuildArguments(
+      const Graph& graph, const std::vector<XlaCompiler::Argument>& args,
+      bool use_tuple_arg, xla::XlaBuilder* builder, XlaContext* context,
+      const std::map<int, xla::OpSharding>& arg_shardings,
+      std::vector<XlaExpression>* arg_expressions,
+      std::vector<int>* input_to_args, std::vector<xla::Shape>* input_shapes,
+      std::string& args_tuple_sdy_sharding, bool is_entry_computation);
+
+  xla::ChannelHandle NewChannel(xla::ChannelHandle::ChannelType type);
 
   // Graph compiler needs to know how to get an optimized graph from a function
   // body.
@@ -299,16 +382,19 @@ class XlaCompiler {
   Options options_;
 
   // Status set to non-OK in the constructor if initialization fails.
-  Status initialization_status_;
+  absl::Status initialization_status_;
 
   // Returns the next step sequence number.
-  int64 NextStepId();
+  int64_t NextStepId();
 
   // Internal sequence number for steps executed on the compilation device.
-  int64 next_step_id_;
+  int64_t next_step_id_;
 
   XlaCompilationDevice* device_;  // Owned by device_mgr_
-  DeviceMgr device_mgr_;
+  StaticDeviceMgr device_mgr_;
+
+  // The next sequence number to assign to a channel.
+  int64_t next_channel_ ABSL_GUARDED_BY(channel_mutex_) = 1;
 
   // To avoid copying the client's function library, use a local function
   // library and runtime for functions created as part of the functionalize
@@ -321,18 +407,36 @@ class XlaCompiler {
   FunctionLibraryRuntime* flib_runtime_;        // owned by pflr_.
 
   struct SignatureHash {
-    uint64 operator()(
-        const std::pair<string, std::vector<Argument>>& signature) const;
+    uint64_t operator()(
+        const std::pair<std::string, std::vector<Argument>>& signature) const;
   };
 
-  std::unordered_map<std::pair<string, std::vector<Argument>>,
+  std::unordered_map<std::pair<std::string, std::vector<Argument>>,
                      CompilationResult, SignatureHash>
       cache_;
 
-  std::unordered_map<string, xla::ChannelHandle> channels_;
+  std::unordered_map<std::string, xla::ChannelHandle> channels_;
 
-  TF_DISALLOW_COPY_AND_ASSIGN(XlaCompiler);
+  std::unordered_map<std::string, tf2xla::HostTransferMetadata>
+      host_compute_sends_;
+  std::unordered_map<std::string, tf2xla::HostTransferMetadata>
+      host_compute_recvs_;
+
+  std::unordered_map<std::string, xla::XlaOp> host_compute_control_output_;
+
+  // This is used to store <node name, token output> mapping. Side-effecting
+  // ops call SetNodeToken() to record its token output, so later side-effecting
+  // ops can use GetNodeToken() to get it and use it as token input.
+  //
+  // It's a stack because we need a mapping like this for each level of nested
+  // CompileGraph() call. In CompileGraph(), we will push a new mapping to the
+  // stack, and pop the mapping before returning.
+  std::stack<std::map<std::string, xla::XlaOp>> node_token_mapping_stack_;
+
+  XlaCompiler(const XlaCompiler&) = delete;
+  void operator=(const XlaCompiler&) = delete;
 };
+
 
 }  // namespace tensorflow
 

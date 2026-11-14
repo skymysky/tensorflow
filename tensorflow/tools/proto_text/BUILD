@@ -1,3 +1,18 @@
+# Copyright 2026 The TensorFlow Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 # Description:
 # This package provides build-time generation of proto3 text format functions
 # (ProtoDebugString, ProtoShortDebugString, and ProtoParseFromString) which
@@ -8,27 +23,28 @@
 # Note that proto3 well-known types (e.g. Any) are not handled in a special way
 # by the generated code.
 
-package(default_visibility = ["//visibility:private"])
-
-licenses(["notice"])  # Apache 2.0
-
-exports_files([
-    "LICENSE",
-    "placeholder.txt",
-])
-
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load(
     "//tensorflow:tensorflow.bzl",
     "if_ios",
-    "tf_generate_proto_text_sources",
     "tf_cc_test",
+    "tf_generate_proto_text_sources",
 )
 
 # For platform specific build config
 load(
-    "//tensorflow/core:platform/default/build_config.bzl",
-    "tf_proto_library_cc",
+    "//tensorflow/core/platform:build_config.bzl",
+    "tf_proto_library",
 )
+
+package(
+    # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
+    default_visibility = ["//visibility:private"],
+    licenses = ["notice"],
+)
+
+exports_files(["placeholder.txt"])
 
 cc_binary(
     name = "gen_proto_text_functions",
@@ -37,9 +53,11 @@ cc_binary(
     visibility = ["//tensorflow:internal"],
     deps = [
         ":gen_proto_text_functions_lib",
-        "@protobuf_archive//:protobuf",
         "//tensorflow/core:lib_proto_parsing",
-    ] + if_ios(["//tensorflow/core/platform/default/build_config:logging"]),
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_protobuf//:protobuf",
+        "@xla//xla/tsl/platform:protobuf_compiler",
+    ] + if_ios(["//tensorflow/core/platform:logging"]),
 )
 
 cc_library(
@@ -49,8 +67,7 @@ cc_library(
     copts = if_ios(["-DGOOGLE_LOGGING"]),
     linkopts = select({
         "//tensorflow:windows": [],
-        "//tensorflow:windows_msvc": [],
-        "//tensorflow:darwin": [
+        "//tensorflow:macos": [
             "-lm",
             "-lpthread",
         ],
@@ -66,18 +83,25 @@ cc_library(
     }),
     deps = [
         "//tensorflow/core:lib_proto_parsing",
-    ] + if_ios(["//tensorflow/core/platform/default/build_config:logging"]),
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+    ] + if_ios(["//tensorflow/core/platform:logging"]),
 )
 
-tf_proto_library_cc(
+tf_proto_library(
     name = "test_proto",
     srcs = ["test.proto"],
 )
 
 tf_generate_proto_text_sources(
-    name = "test_proto_text_srcs",
+    name = "test_proto_text",
     srcs = ["test.proto"],
     srcs_relative_dir = "tensorflow/tools/proto_text/",
+    deps = [
+        ":test_proto_cc",
+        "//tensorflow/core:lib",
+        "//tensorflow/core:lib_internal",
+    ],
 )
 
 tf_cc_test(
@@ -95,19 +119,4 @@ tf_cc_test(
         "//tensorflow/core:test",
         "//tensorflow/core:test_main",
     ],
-)
-
-# -----------------------------------------------------------------------------
-# Google-internal targets.  These must be at the end for syncrepo.
-
-filegroup(
-    name = "all_files",
-    srcs = glob(
-        ["**/*"],
-        exclude = [
-            "**/METADATA",
-            "**/OWNERS",
-        ],
-    ),
-    visibility = ["//tensorflow:__subpackages__"],
 )

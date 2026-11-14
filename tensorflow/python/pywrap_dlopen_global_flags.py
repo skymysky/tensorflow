@@ -14,27 +14,27 @@
 # =============================================================================
 """If possible, exports all symbols with RTLD_GLOBAL.
 
-Note that this file is only imported by pywrap_tensorflow.py if this is a static
-build (meaning there is no explicit framework cc_binary shared object dependency
-of _pywrap_tensorflow_internal.so). For regular (non-static) builds, RTLD_GLOBAL
-is not necessary, since the dynamic dependencies of custom/contrib ops are
-explicit.
-"""
+This module is packaged only for monolithic builds (framework_shared_object
+unset/false, e.g. --config=monolithic). Shared-object builds (default pip
+wheels) omit it on purpose so pywrap_tensorflow.py hits ImportError and loads
+with RTLD_LOCAL instead.
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
+RTLD_GLOBAL is required for monolithic Python loads so custom op shared objects
+can resolve TF symbols from the global table. It must NOT be used for shared
+wheels: TF links LLVM/MLIR, and leaking those symbols globally causes ABI
+clashes (SIGSEGV) when a later import (e.g. triton) brings its own LLVM. See
+tensorflow/tensorflow#124205.
+"""
 
 import ctypes
 import sys
 
-# On UNIX-based platforms, pywrap_tensorflow is a SWIG-generated
-# python library that dynamically loads _pywrap_tensorflow.so. The
-# default mode for loading keeps all the symbol private and not
-# visible to other libraries that may be loaded. Setting the mode to
-# RTLD_GLOBAL to make the symbols visible, so that custom op libraries
-# imported using `tf.load_op_library()` can access symbols defined in
-# _pywrap_tensorflow.so.
+# On UNIX-based platforms, pywrap_tensorflow is a SWIG-generated python library
+# that dynamically loads _pywrap_tensorflow.so. The default mode for loading
+# keeps all the symbol private and not visible to other libraries that may be
+# loaded. Setting the mode to RTLD_GLOBAL to make the symbols visible, so that
+# custom op libraries imported using `tf.load_op_library()` can access symbols
+# defined in _pywrap_tensorflow.so.
 _use_rtld_global = (hasattr(sys, 'getdlopenflags')
                     and hasattr(sys, 'setdlopenflags'))
 if _use_rtld_global:

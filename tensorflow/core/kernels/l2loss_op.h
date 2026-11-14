@@ -13,9 +13,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef TENSORFLOW_KERNELS_L2LOSS_OP_H_
-#define TENSORFLOW_KERNELS_L2LOSS_OP_H_
-#include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
+#ifndef TENSORFLOW_CORE_KERNELS_L2LOSS_OP_H_
+#define TENSORFLOW_CORE_KERNELS_L2LOSS_OP_H_
+#include "unsupported/Eigen/CXX11/Tensor"  // from @eigen_archive
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/tensor_types.h"
 
@@ -25,9 +25,9 @@ template <typename Device, typename T>
 struct L2LossOp : public OpKernel {
   explicit L2LossOp(OpKernelConstruction* context) : OpKernel(context) {}
 
-  void Compute(OpKernelContext* context) {}
+  void Compute(OpKernelContext* context) override {}
 };
 
 }  // namespace tensorflow
 
-#endif  // TENSORFLOW_KERNELS_L2LOSS_OP_H_
+#endif  // TENSORFLOW_CORE_KERNELS_L2LOSS_OP_H_

@@ -13,10 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 """Readline-Based Command-Line Interface of TensorFlow Debugger (tfdbg)."""
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import readline
 
 from tensorflow.python.debug.cli import base_ui
@@ -39,11 +35,7 @@ class ReadlineUI(base_ui.BaseUI):
     readline.set_completer(self._readline_complete)
     readline.parse_and_bind("tab: complete")
 
-    # For Python 2-3 compatibility.
-    try:
-      self._input = raw_input
-    except NameError:
-      self._input = input
+    self._input = input
 
   def _readline_complete(self, text, state):
     context, prefix, except_last_word = self._analyze_tab_complete_input(text)

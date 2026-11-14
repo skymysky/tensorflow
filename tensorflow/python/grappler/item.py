@@ -14,13 +14,9 @@
 # ==============================================================================
 """A python interface for Grappler items."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 from tensorflow.core.grappler.costs import op_performance_data_pb2
-from tensorflow.python import pywrap_tensorflow as tf_item
-from tensorflow.python.framework import errors
+from tensorflow.core.protobuf import meta_graph_pb2
+from tensorflow.python.grappler import _pywrap_tf_item as tf_item
 
 
 class Item(object):
@@ -42,29 +38,40 @@ class Item(object):
       ValueError: the metagraph is incomplete or invalid.
     """
     self._metagraph = metagraph
+    self._item_graph = meta_graph_pb2.MetaGraphDef()
+    self._item_graph.CopyFrom(metagraph)
+    self._ignore_colocation = ignore_colocation
+    self._ignore_user_placement = ignore_user_placement
     self._tf_item = None
-    with errors.raise_exception_on_not_ok_status() as status:
-      self._tf_item = tf_item.TF_NewItem(metagraph.SerializeToString(),
-                                         ignore_colocation,
-                                         ignore_user_placement, status)
+    self._BuildTFItem()
 
-  def __del__(self):
-    if self._tf_item:
-      tf_item.TF_DeleteItem(self._tf_item)
-
-  def IdentifyImportantOps(self):
-    return tf_item.TF_IdentifyImportantOps(self._tf_item)
+  def IdentifyImportantOps(self, sort_topologically=False):
+    return tf_item.TF_IdentifyImportantOps(self.tf_item, sort_topologically)
 
   def GetOpProperties(self):
-    ret_from_swig = tf_item.TF_GetOpProperties(self._tf_item)
+    """Get Op properties."""
+    props = tf_item.TF_GetOpProperties(self.tf_item)
     properties = {}
-    for key, values in ret_from_swig.items():
+    for key, values in props.items():
       prop = []
       for value in values:
+        # TODO(petebu): Make this conversion to a dictionary be done in the C++
+        # wrapper for performance.
         prop.append(
             op_performance_data_pb2.OpInfo.TensorProperties.FromString(value))
       properties[key] = prop
     return properties
+
+  def GetColocationGroups(self):
+    """Return a list of hard colocation constraints.
+
+    All the nodes in a colocation tuple must be placed on the same device for
+    the model to work.
+
+    Returns:
+      A list of colocation tuples.
+    """
+    return tf_item.TF_GetColocationGroups(self.tf_item)
 
   @property
   def metagraph(self):
@@ -72,4 +79,12 @@ class Item(object):
 
   @property
   def tf_item(self):
+    if self._item_graph != self._metagraph:
+      self._BuildTFItem()
+      self._item_graph.CopyFrom(self._metagraph)
     return self._tf_item
+
+  def _BuildTFItem(self):
+    self._tf_item = tf_item.TF_NewItem(self._metagraph.SerializeToString(),
+                                       self._ignore_colocation,
+                                       self._ignore_user_placement)

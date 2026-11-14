@@ -13,23 +13,29 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include <atomic>
-
 #include "tensorflow/core/util/reffed_status_callback.h"
 
+#include <atomic>
+#include <utility>
+
+#include "absl/status/status.h"
+#include "absl/strings/match.h"
+#include "absl/strings/str_cat.h"
+#include "absl/synchronization/notification.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/core/notification.h"
 #include "tensorflow/core/lib/core/threadpool.h"
 #include "tensorflow/core/platform/env.h"
 #include "tensorflow/core/platform/test.h"
+#include "tensorflow/core/protobuf/error_codes.pb.h"
 
 namespace tensorflow {
 namespace {
 
 TEST(TestReffedStatusCallback, CallsBackOK) {
   bool called = false;
-  Status status = errors::InvalidArgument("");
-  auto done = [&called, &status](const Status& s) {
+  absl::Status status = absl::InvalidArgumentError("");
+  auto done = [&called, &status](const absl::Status& s) {
     called = true;
     status = s;
   };
@@ -42,46 +48,53 @@ TEST(TestReffedStatusCallback, CallsBackOK) {
 
 TEST(TestReffedStatusCallback, CallsBackFail) {
   bool called = false;
-  Status status = Status::OK();
-  auto done = [&called, &status](const Status& s) {
+  absl::Status status = absl::OkStatus();
+  auto done = [&called, &status](const absl::Status& s) {
     called = true;
     status = s;
   };
   auto* cb = new ReffedStatusCallback(std::move(done));
-  cb->UpdateStatus(errors::Internal("1"));
-  cb->UpdateStatus(errors::Internal("2"));  // Will be ignored.
+  cb->UpdateStatus(absl::InternalError("1"));
+  cb->UpdateStatus(absl::InvalidArgumentError("2"));
   EXPECT_FALSE(called);
   cb->Unref();
   EXPECT_TRUE(called);
-  EXPECT_EQ(status.error_message(), "1");
+  // Should be one of the two given error codes.
+  EXPECT_THAT(status.code(),
+              ::testing::AnyOf(error::INTERNAL, error::INVALID_ARGUMENT));
+  // Both errors are reported.
+  EXPECT_TRUE(absl::StrContains(status.message(), "1"));
+  EXPECT_TRUE(absl::StrContains(status.message(), "2"));
 }
 
 TEST(TestReffedStatusCallback, RefMulti) {
   int called = false;
-  Status status = Status::OK();
-  auto done = [&called, &status](const Status& s) {
+  absl::Status status = absl::OkStatus();
+  auto done = [&called, &status](const absl::Status& s) {
     called = true;
     status = s;
   };
   auto* cb = new ReffedStatusCallback(std::move(done));
   cb->Ref();
-  cb->UpdateStatus(errors::Internal("1"));
+  cb->UpdateStatus(absl::InternalError("1"));
   cb->Ref();
-  cb->UpdateStatus(errors::Internal("2"));  // Will be ignored.
+  cb->UpdateStatus(absl::InternalError("2"));
   cb->Unref();
   cb->Unref();
   EXPECT_FALSE(called);
   cb->Unref();  // Created by constructor.
   EXPECT_TRUE(called);
-  EXPECT_EQ(status.error_message(), "1");
+  // Both errors are reported.
+  EXPECT_TRUE(absl::StrContains(status.message(), "1"));
+  EXPECT_TRUE(absl::StrContains(status.message(), "2"));
 }
 
 TEST(TestReffedStatusCallback, MultiThreaded) {
   std::atomic<int> num_called(0);
-  Status status;
-  Notification n;
+  absl::Status status;
+  absl::Notification n;
 
-  auto done = [&num_called, &status, &n](const Status& s) {
+  auto done = [&num_called, &status, &n](const absl::Status& s) {
     ++num_called;
     status = s;
     n.Notify();
@@ -93,7 +106,7 @@ TEST(TestReffedStatusCallback, MultiThreaded) {
   for (int i = 0; i < 5; ++i) {
     cb->Ref();
     threads.Schedule([cb]() {
-      cb->UpdateStatus(errors::InvalidArgument("err"));
+      cb->UpdateStatus(absl::InvalidArgumentError("err"));
       cb->Unref();
     });
   }
@@ -104,7 +117,8 @@ TEST(TestReffedStatusCallback, MultiThreaded) {
   n.WaitForNotification();
 
   EXPECT_EQ(num_called.load(), 1);
-  EXPECT_EQ(status.error_message(), "err");
+  EXPECT_EQ(status.code(), error::INVALID_ARGUMENT);
+  EXPECT_TRUE(absl::StrContains(status.message(), "err"));
 }
 
 }  // namespace

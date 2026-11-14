@@ -13,9 +13,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef THIRD_PARTY_TENSORFLOW_CC_FRAMEWORK_GRADIENT_CHECKER_H_
-#define THIRD_PARTY_TENSORFLOW_CC_FRAMEWORK_GRADIENT_CHECKER_H_
+#ifndef TENSORFLOW_CC_FRAMEWORK_GRADIENT_CHECKER_H_
+#define TENSORFLOW_CC_FRAMEWORK_GRADIENT_CHECKER_H_
 
+#include <vector>
+
+#include "absl/status/status.h"
 #include "tensorflow/cc/framework/ops.h"
 #include "tensorflow/cc/framework/scope.h"
 #include "tensorflow/core/framework/tensor.h"
@@ -46,18 +49,18 @@ namespace tensorflow {
 /// if y = Complex(x, x) where x is DT_FLOAT (so y is DT_COMPLEX64)
 /// <X_T, Y_T, JAC_T> should be <float, complex64, float>
 template <typename X_T, typename Y_T, typename JAC_T>
-Status ComputeGradientError(const Scope& scope, const OutputList& xs,
-                            const std::vector<TensorShape>& x_shapes,
-                            const OutputList& ys,
-                            const std::vector<TensorShape>& y_shapes,
-                            JAC_T* max_error);
+absl::Status ComputeGradientError(const Scope& scope, const OutputList& xs,
+                                  const std::vector<TensorShape>& x_shapes,
+                                  const OutputList& ys,
+                                  const std::vector<TensorShape>& y_shapes,
+                                  JAC_T* max_error);
 
 /// Overload of ComputeGradientError which takes an initial value for 'x'.
 template <typename X_T, typename Y_T, typename JAC_T>
-Status ComputeGradientError(const Scope& scope, const Output& x,
-                            const Tensor& x_init_value, const Output& y,
-                            const TensorShape& y_shape, JAC_T* max_error);
+absl::Status ComputeGradientError(const Scope& scope, const Output& x,
+                                  const Tensor& x_init_value, const Output& y,
+                                  const TensorShape& y_shape, JAC_T* max_error);
 
 }  // namespace tensorflow
 
-#endif  // THIRD_PARTY_TENSORFLOW_CC_FRAMEWORK_GRADIENT_CHECKER_H_
+#endif  // TENSORFLOW_CC_FRAMEWORK_GRADIENT_CHECKER_H_

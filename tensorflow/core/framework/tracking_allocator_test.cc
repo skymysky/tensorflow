@@ -26,7 +26,7 @@ namespace tensorflow {
 
 class TestableSizeTrackingAllocator : public Allocator {
  public:
-  string Name() override { return "test"; }
+  std::string Name() override { return "test"; }
   void* AllocateRaw(size_t /*alignment*/, size_t num_bytes) override {
     void* ptr = port::Malloc(num_bytes);
     size_map_[ptr] = num_bytes;
@@ -38,27 +38,27 @@ class TestableSizeTrackingAllocator : public Allocator {
     size_map_.erase(iter);
     port::Free(ptr);
   }
-  bool TracksAllocationSizes() override { return true; }
-  size_t RequestedSize(void* ptr) override {
+  bool TracksAllocationSizes() const override { return true; }
+  size_t RequestedSize(const void* ptr) const override {
     const auto& iter = size_map_.find(ptr);
     EXPECT_NE(size_map_.end(), iter);
     return iter->second;
   }
-  void GetStats(AllocatorStats* stats) override { stats->Clear(); }
+  std::optional<AllocatorStats> GetStats() override { return std::nullopt; }
 
  private:
-  std::unordered_map<void*, size_t> size_map_;
+  std::unordered_map<const void*, size_t> size_map_;
 };
 
 class NoMemoryAllocator : public Allocator {
  public:
-  string Name() override { return "test"; }
+  std::string Name() override { return "test"; }
   void* AllocateRaw(size_t /*alignment*/, size_t num_bytes) override {
     return nullptr;
   }
   void DeallocateRaw(void* ptr) override {}
-  bool TracksAllocationSizes() override { return true; }
-  void GetStats(AllocatorStats* stats) override { stats->Clear(); }
+  bool TracksAllocationSizes() const override { return true; }
+  std::optional<AllocatorStats> GetStats() override { return std::nullopt; }
 };
 
 TEST(TrackingAllocatorTest, SimpleNoTracking) {

@@ -1,4 +1,4 @@
-/* Copyright 2017 The TensorFlow Authors. All Rights Reserved.
+/* Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,150 +13,48 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include <sstream>
-#include "tensorflow/compiler/tf2xla/kernels/cwise_ops.h"
-#include "tensorflow/compiler/tf2xla/shape_util.h"
+#include <algorithm>
+#include <cstdint>
+#include <limits>
+#include <vector>
+
+#include "tensorflow/compiler/tf2xla/lib/scatter.h"
 #include "tensorflow/compiler/tf2xla/type_util.h"
-#include "tensorflow/compiler/tf2xla/xla_helpers.h"
+#include "tensorflow/compiler/tf2xla/xla_op_kernel.h"
 #include "tensorflow/compiler/tf2xla/xla_op_registry.h"
-#include "tensorflow/compiler/xla/client/computation_builder.h"
-#include "tensorflow/compiler/xla/literal_util.h"
-#include "tensorflow/core/framework/kernel_def_builder.h"
-#include "tensorflow/core/framework/types.h"
+#include "xla/hlo/builder/lib/constants.h"
+#include "xla/hlo/builder/lib/math.h"
+#include "xla/hlo/builder/value_inference.h"
+#include "xla/hlo/builder/xla_builder.h"
+#include "xla/primitive_util.h"
+#include "xla/shape.h"
+#include "xla/xla_data.pb.h"
+#include "tensorflow/core/framework/op_kernel.h"
+#include "tensorflow/core/framework/op_requires.h"
+#include "tensorflow/core/framework/tensor_shape.h"
+#include "tensorflow/core/framework/types.pb.h"
+#include "tensorflow/core/platform/errors.h"
 
 namespace tensorflow {
-
-xla::ComputationDataHandle XlaComputeScatterAddDynamicSlice(
-    XlaOpKernelContext* ctx, const xla::ComputationDataHandle& input,
-    const TensorShape& input_shape, const xla::ComputationDataHandle& indices,
-    const TensorShape& indices_shape, int64 num_segments, DataType dtype,
-    xla::ComputationBuilder* builder) {
-  // Flatten data for dynamic indexing via indices_1d.
-  TensorShape input_shape_i(input_shape);
-  for (int64 d = 0; d < indices_shape.dims(); ++d) {
-    input_shape_i.RemoveDim(0);
-  }
-  TensorShape flat_shape({indices_shape.num_elements()});
-  flat_shape.AppendShape(input_shape_i);
-
-  // output is same as flattened input shape with dim_size(0) = num_segments.
-  TensorShape out_shape(flat_shape);
-  out_shape.set_dim(0, num_segments);
-
-  // TODO(b/37575001) The tensor in which we construct the output during
-  // the loop must have rank >= 3 as a workaround for lowering issues.
-  int64 extra_dims = 0;
-  if (out_shape.dims() < 3) {
-    extra_dims = 3 - out_shape.dims();
-  }
-  TensorShape loop_out_shape;
-  for (int64 k = 0; k < extra_dims; ++k) {
-    loop_out_shape.AddDim(1);
-  }
-  loop_out_shape.AppendShape(out_shape);
-
-  // Slices from the input data are same shape as the input data, except dim 0.
-  TensorShape slice_shape(flat_shape);
-  slice_shape.set_dim(0, 1);
-  // slices are reshaped into the rank >= 3 shape of the loop-carried output
-  TensorShape loop_out_slice_shape(loop_out_shape);
-  loop_out_slice_shape.set_dim(extra_dims, 1);
-
-  // Construct the initial values of the loop-carried variables
-  // Flatten the indices into 1-D for ease of iteration.
-  auto indices_1d = builder->Reshape(indices, {indices_shape.num_elements()});
-  // Flatten the data for ease of indexing via values in indices_1d.
-  auto data_flat = builder->Reshape(input, flat_shape.dim_sizes());
-
-  auto init_i = builder->ConstantR0<int32>(0);
-  auto init_out = builder->Broadcast(XlaHelpers::Zero(builder, dtype),
-                                     loop_out_shape.dim_sizes());
-
-  xla::PrimitiveType ptype;
-  TF_CHECK_OK(DataTypeToPrimitiveType(dtype, &ptype));
-
-  std::vector<xla::Shape> tuple_shapes(
-      {// The loop iteration counter is a scalar, incremented each iteration.
-       xla::ShapeUtil::MakeShape(xla::S32, {}),
-       // The flattened input data is loop invariant.
-       xla::ShapeUtil::MakeShape(ptype, flat_shape.dim_sizes()),
-       // The scatter indices tensor is loop invariant.
-       xla::ShapeUtil::MakeShape(xla::S32, {indices_shape.num_elements()}),
-       // The output data array is updated each loop iteration.
-       xla::ShapeUtil::MakeShape(ptype, loop_out_shape.dim_sizes())});
-  xla::Shape tuple_shape = xla::ShapeUtil::MakeTupleShape(tuple_shapes);
-
-  auto init = builder->Tuple({init_i, data_flat, indices_1d, init_out});
-
-  // Construct the while loop condition (i < num_indices)
-  xla::ComputationBuilder condb(ctx->builder()->client(),
-                                "ScatterAddWhileCond");
-  condb.Lt(condb.GetTupleElement(
-               condb.Parameter(0, tuple_shape, "ScatterAddWhileTuple"), 0),
-           condb.ConstantR0<int32>(indices_shape.num_elements()));
-  auto cond_status = condb.Build();
-  // TF_CHECK_OK(cond_status);
-  auto cond = cond_status.ConsumeValueOrDie();
-
-  // Construct the while loop body's function. The implementation of scatter is:
-  // for i in range(num_indices):
-  //   index = dynamic-slice(indices, i)
-  //   xi = dynamic-slice(input, i)
-  //   output = dynamic-update-slice(output, xi, index)
-  xla::ComputationBuilder bodyb(ctx->builder()->client(),
-                                "ScatterAddWhileBody");
-  {
-    auto input_tuple = bodyb.Parameter(0, tuple_shape, "ScatterAddWhileTuple");
-    auto i = bodyb.GetTupleElement(input_tuple, 0);
-    auto data = bodyb.GetTupleElement(input_tuple, 1);
-    auto idcs = bodyb.GetTupleElement(input_tuple, 2);
-    auto output = bodyb.GetTupleElement(input_tuple, 3);
-
-    // Index into the data array at i.
-    auto zero = bodyb.ConstantR1<int32>({0});
-    std::vector<xla::ComputationDataHandle> index_vals(flat_shape.dims(), zero);
-    index_vals[0] = bodyb.Reshape(i, {1});
-    auto index = bodyb.ConcatInDim(index_vals, 0);
-
-    auto data_slice =
-        bodyb.Reshape(bodyb.DynamicSlice(data, index, slice_shape.dim_sizes()),
-                      loop_out_slice_shape.dim_sizes());
-
-    // Index into the output array.
-    // Construct the index into the R3+ output array 0, ..., <index>, 0, ...
-    std::vector<xla::ComputationDataHandle> out_index_vals(
-        loop_out_shape.dims(), zero);
-    out_index_vals[extra_dims] =
-        bodyb.DynamicSlice(idcs, bodyb.Reshape(i, {1}), {1});
-    auto out_index = bodyb.ConcatInDim(out_index_vals, 0);
-
-    // Slice the output array, update value, and update the output slice.
-    auto updated_output = bodyb.DynamicUpdateSlice(
-        output,
-        bodyb.Add(data_slice,
-                  bodyb.DynamicSlice(output, out_index,
-                                     loop_out_slice_shape.dim_sizes())),
-        out_index);
-
-    auto ip1 = bodyb.Add(i, bodyb.ConstantR0<int32>(1));
-    bodyb.Tuple({ip1, data, idcs, updated_output});
-  }
-  auto body_status = bodyb.Build();
-  // TF_CHECK_OK(body_status);
-  auto body = body_status.ConsumeValueOrDie();
-
-  auto gather_while = builder->While(cond, body, init);
-  auto updated_output = builder->GetTupleElement(gather_while, 3);
-  return builder->Reshape(updated_output, out_shape.dim_sizes());
-}
-
 namespace {
 
-class UnsortedSegmentSum : public XlaOpKernel {
+class SegmentReduce : public XlaOpKernel {
  public:
-  explicit UnsortedSegmentSum(OpKernelConstruction* ctx) : XlaOpKernel(ctx) {
-    OP_REQUIRES_OK(ctx, ctx->GetAttr("T", &dtype_));
+  explicit SegmentReduce(OpKernelConstruction* ctx, bool indices_are_sorted)
+      : XlaOpKernel(ctx), indices_are_sorted_(indices_are_sorted) {
+    DataType dtype;
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("T", &dtype));
+    OP_REQUIRES_OK(ctx, DataTypeToPrimitiveType(dtype, &type_));
   }
+
+  // The initial value to initialize elements of the output to.
+  virtual xla::XlaOp InitialValue(xla::XlaBuilder* builder) = 0;
+
+  // A function to combine two scalars with the same index (e.g., sum).
+  virtual xla::XlaOp Combine(xla::XlaOp a, xla::XlaOp b) = 0;
+
+  // Whether to pre-filter/replace NaNs in updates logic.
+  virtual bool FilterNaNs() const { return false; }
 
   void Compile(XlaOpKernelContext* ctx) override {
     // output = unsorted_segment_sum(data, indices, num_segments)
@@ -165,44 +63,260 @@ class UnsortedSegmentSum : public XlaOpKernel {
     //    output[i] == 0 if i does not appear in indices
     //
     // Contrast with segment_sum(), which assumes indices are sorted and that
-    // max(indices)+1 is the desired size of the output.
+    // max(indices)+1 is the desired size of the output. Note that
+    // segment_sum_v2 also takes num_segments as an input and can be supported
+    // similarly.
     //
     // The returned output tensor has the same type as data, and the same shape
     // as data with the first indices.rank dimensions are replaced
     // by a single dimension with size num_segments.
     auto data = ctx->Input(0);
-    auto data_shape = ctx->InputShape(0);
+    TensorShape data_shape = ctx->InputShape(0);
 
     auto indices = ctx->Input(1);
-    auto indices_shape = ctx->InputShape(1);
+    TensorShape indices_shape = ctx->InputShape(1);
 
-    int64 num_segments;
-    OP_REQUIRES_OK(ctx, ctx->ConstantInputAsIntScalar(2, &num_segments));
-
+    int64_t num_segments;
+    OP_REQUIRES_OK(ctx,
+                   ctx->ConstantInputAsIntScalar(
+                       2, &num_segments, xla::ValueInferenceMode::kUpperBound));
+    // Reject a negative num_segments like the TensorFlow kernels, before it
+    // reaches TensorShape, which CHECK-fails on negative sizes.
+    OP_REQUIRES(ctx, num_segments >= 0,
+                errors::InvalidArgument("Input num_segments == ", num_segments,
+                                        " must not be negative."));
     OP_REQUIRES(ctx, data_shape.dims() >= indices_shape.dims(),
-                errors::InvalidArgument(
-                    "UnsortedSegmentSum requires that indices' rank be"
-                    " less than or equal to data's rank."));
+                errors::InvalidArgument(type_string(),
+                                        " requires that indices' rank be"
+                                        " less than or equal to data's rank."));
+
+    // InputShape() reports a bounded-dynamic dimension as its upper bound, so
+    // two prefix dimensions that are equal at run time can still disagree
+    // here. Reconcile the operands first: their run-time sizes are equal, so
+    // both fit within the smaller of the two bounds. Slice the larger side
+    // down to that bound and re-apply its run-time size. Only a dimension
+    // that is actually dynamic is sliced, so a genuine static mismatch still
+    // fails the check below. This has to reach the operands rather than just
+    // the check, because xla::Scatter compares the same bounds again during
+    // shape inference and tolerates only unbounded dynamic sizes. Where
+    // cwise_ops.cc pads the smaller side up when both sides are dynamic,
+    // slicing is safe here: segment reduction does not broadcast, so there is
+    // no size-1 dimension to preserve. The run-time size is clamped to the
+    // reduced bound, which XLA requires of a dynamic dimension; an input that
+    // trips the clamp had unequal prefix dimensions at run time and was
+    // already invalid for this op.
+    OP_REQUIRES_VALUE(xla::Shape data_xla_shape, ctx, ctx->InputXlaShape(0));
+    OP_REQUIRES_VALUE(xla::Shape indices_xla_shape, ctx, ctx->InputXlaShape(1));
+    OP_REQUIRES(
+        ctx,
+        data_xla_shape.dimensions().size() == data_shape.dims() &&
+            indices_xla_shape.dimensions().size() == indices_shape.dims(),
+        errors::Internal(type_string(), " got mismatched ranks for data (",
+                         data_xla_shape.dimensions().size(), " vs. ",
+                         data_shape.dims(), ") or indices (",
+                         indices_xla_shape.dimensions().size(), " vs. ",
+                         indices_shape.dims(), ")"));
+    for (int d = 0; d < indices_shape.dims(); ++d) {
+      const int64_t data_bound = data_shape.dim_size(d);
+      const int64_t indices_bound = indices_shape.dim_size(d);
+      if (data_bound > indices_bound &&
+          data_xla_shape.is_dynamic_dimension(d)) {
+        // Dimension sizes are S32, so clamp the bound before narrowing it.
+        const int32_t size_bound = static_cast<int32_t>(std::min<int64_t>(
+            indices_bound, std::numeric_limits<int32_t>::max()));
+        xla::XlaOp size =
+            xla::Min(xla::GetDimensionSize(data, d),
+                     xla::ConstantR0<int32_t>(ctx->builder(), size_bound));
+        data = xla::SliceInDim(data, /*start_index=*/0,
+                               /*limit_index=*/indices_bound, /*stride=*/1,
+                               /*dimno=*/d);
+        data = xla::SetDimensionSize(data, size, d);
+        data_shape.set_dim(d, indices_bound);
+      } else if (indices_bound > data_bound &&
+                 indices_xla_shape.is_dynamic_dimension(d)) {
+        const int32_t size_bound = static_cast<int32_t>(
+            std::min<int64_t>(data_bound, std::numeric_limits<int32_t>::max()));
+        xla::XlaOp size =
+            xla::Min(xla::GetDimensionSize(indices, d),
+                     xla::ConstantR0<int32_t>(ctx->builder(), size_bound));
+        indices = xla::SliceInDim(indices, /*start_index=*/0,
+                                  /*limit_index=*/data_bound, /*stride=*/1,
+                                  /*dimno=*/d);
+        indices = xla::SetDimensionSize(indices, size, d);
+        indices_shape.set_dim(d, data_bound);
+      }
+    }
+
     // Validate that indices.shape is a prefix of data.shape.
     for (int d = 0; d < indices_shape.dims(); ++d) {
-      OP_REQUIRES(ctx, (data_shape.dim_size(d) == indices_shape.dim_size(d)),
-                  errors::InvalidArgument(
-                      "UnsortedSegmentSum requires indices shape to be prefix"
-                      " of data_shape, but dimension ",
-                      d, " differs ", data_shape.dim_size(d), " vs. ",
-                      indices_shape.dim_size(d)));
+      OP_REQUIRES(
+          ctx, (data_shape.dim_size(d) == indices_shape.dim_size(d)),
+          errors::InvalidArgument(type_string(),
+                                  " requires indices shape to be prefix"
+                                  " of data_shape, but dimension ",
+                                  d, " differs ", data_shape.dim_size(d),
+                                  " vs. ", indices_shape.dim_size(d)));
     }
-    auto result = XlaComputeScatterAddDynamicSlice(
-        ctx, data, data_shape, indices, indices_shape, num_segments, dtype_,
-        ctx->builder());
-    ctx->SetOutput(0, result);
+    xla::XlaBuilder* builder = ctx->builder();
+    // data shape = [indices_shape, segment_shape]
+    // buffer shape = [num_segment, segment_shape]
+    // We now create the buffer shape by reverse enginerring data shape into
+    // indices shape and segment shape.
+    TensorShape buffer_shape = data_shape;
+    buffer_shape.RemoveDimRange(0, indices_shape.dims());
+    buffer_shape.InsertDim(0, num_segments);
+
+    auto buffer =
+        xla::Broadcast(InitialValue(builder), buffer_shape.dim_sizes());
+
+    // Build dynamic dim sizes for buffer, as well as whether each dimension
+    // size is dynamic or static. We build two parts: num_sgement part and
+    // segment_shape part.
+    std::vector<xla::XlaOp> buffer_dims;
+    std::vector<bool> buffer_dims_are_dynamic;
+    // Build the "num_segment" part.
+    bool num_segments_is_dynamic;
+    OP_REQUIRES_OK(
+        ctx, ctx->ResolveInputDynamismIntoPred(2, &num_segments_is_dynamic));
+
+    xla::XlaOp num_segments_size = ctx->Input(2);
+    if (num_segments_is_dynamic) {
+      // SetDimensionSize takes an S32 size. The check above only sees the
+      // bound of a num_segments known only at run time, so clamp a negative
+      // one at 0 rather than set it as the dimension size. Clamp in the
+      // original width, so that an int64 size doesn't wrap when narrowed.
+      num_segments_size =
+          xla::Clamp(xla::ScalarLike(num_segments_size, 0), num_segments_size,
+                     xla::ScalarLike(num_segments_size,
+                                     std::numeric_limits<int32_t>::max()));
+      if (ctx->input_xla_type(2) != xla::S32) {
+        num_segments_size =
+            xla::ConvertElementType(num_segments_size, xla::S32);
+      }
+    }
+    buffer_dims.insert(buffer_dims.begin(), num_segments_size);
+    buffer_dims_are_dynamic.insert(buffer_dims_are_dynamic.begin(),
+                                   num_segments_is_dynamic);
+    // Build the segment shape part.
+    for (int64_t i = indices_shape.dims(); i < data_shape.dims(); ++i) {
+      buffer_dims.push_back(xla::GetDimensionSize(data, i));
+      buffer_dims_are_dynamic.push_back(
+          ctx->InputXlaShape(0)->is_dynamic_dimension(i));
+    }
+
+    for (int64_t i = 0; i < buffer_dims.size(); ++i) {
+      if (buffer_dims_are_dynamic[i]) {
+        // For each dynamic dimension, call set-dimension-size on it.
+        buffer = xla::SetDimensionSize(buffer, buffer_dims[i], i);
+      }
+    }
+
+    // With no segments, every segment id is dropped and the result is empty.
+    // XlaScatter rejects a scatter into a dimension of size zero, so return
+    // the empty buffer as is.
+    if (num_segments == 0) {
+      ctx->SetOutput(0, buffer);
+      return;
+    }
+
+    if (FilterNaNs() && xla::primitive_util::IsFloatingPointType(type_)) {
+      data = xla::Select(xla::IsNan(data), InitialValue(builder), data);
+    }
+
+    auto combiner = [this](xla::XlaOp a, xla::XlaOp b,
+                           xla::XlaBuilder* builder) { return Combine(a, b); };
+
+    auto result = XlaScatter(buffer, /*updates=*/data, indices,
+                             /*indices_are_vectors=*/false, indices_are_sorted_,
+                             combiner, builder);
+    OP_REQUIRES_OK(ctx, result.status());
+    ctx->SetOutput(0, result.value());
   }
 
- private:
-  DataType dtype_;
+ protected:
+  xla::PrimitiveType type_;
+  bool indices_are_sorted_;
 };
 
-REGISTER_XLA_OP(Name("UnsortedSegmentSum"), UnsortedSegmentSum);
+template <bool indices_are_sorted>
+class SegmentSum : public SegmentReduce {
+ public:
+  explicit SegmentSum(OpKernelConstruction* ctx)
+      : SegmentReduce(ctx, indices_are_sorted) {}
+
+  xla::XlaOp InitialValue(xla::XlaBuilder* builder) override {
+    return xla::Zero(builder, type_);
+  };
+  xla::XlaOp Combine(xla::XlaOp a, xla::XlaOp b) override { return a + b; };
+};
+
+REGISTER_XLA_OP(Name("SegmentSumV2").CompileTimeConstantInput("num_segments"),
+                SegmentSum</*indices_are_sorted=*/true>);
+REGISTER_XLA_OP(
+    Name("UnsortedSegmentSum").CompileTimeConstantInput("num_segments"),
+    SegmentSum</*indices_are_sorted=*/false>);
+
+template <bool indices_are_sorted>
+class SegmentProd : public SegmentReduce {
+ public:
+  explicit SegmentProd(OpKernelConstruction* ctx)
+      : SegmentReduce(ctx, indices_are_sorted) {}
+
+  xla::XlaOp InitialValue(xla::XlaBuilder* builder) override {
+    return xla::One(builder, type_);
+  };
+  xla::XlaOp Combine(xla::XlaOp a, xla::XlaOp b) override { return a * b; };
+};
+
+REGISTER_XLA_OP(
+    Name("UnsortedSegmentProd").CompileTimeConstantInput("num_segments"),
+    SegmentProd</*indices_are_sorted=*/false>);
+REGISTER_XLA_OP(Name("SegmentProdV2").CompileTimeConstantInput("num_segments"),
+                SegmentProd</*indices_are_sorted=*/true>);
+
+template <bool indices_are_sorted>
+class SegmentMin : public SegmentReduce {
+ public:
+  explicit SegmentMin(OpKernelConstruction* ctx)
+      : SegmentReduce(ctx, indices_are_sorted) {}
+
+  bool FilterNaNs() const override { return true; }
+
+  xla::XlaOp InitialValue(xla::XlaBuilder* builder) override {
+    return xla::MaxFiniteValue(builder, type_);
+  };
+  xla::XlaOp Combine(xla::XlaOp a, xla::XlaOp b) override {
+    return xla::Min(a, b);
+  };
+};
+
+REGISTER_XLA_OP(
+    Name("UnsortedSegmentMin").CompileTimeConstantInput("num_segments"),
+    SegmentMin</*indices_are_sorted=*/false>);
+REGISTER_XLA_OP(Name("SegmentMinV2").CompileTimeConstantInput("num_segments"),
+                SegmentMin</*indices_are_sorted=*/true>);
+
+template <bool indices_are_sorted>
+class SegmentMax : public SegmentReduce {
+ public:
+  explicit SegmentMax(OpKernelConstruction* ctx)
+      : SegmentReduce(ctx, indices_are_sorted) {}
+
+  bool FilterNaNs() const override { return true; }
+
+  xla::XlaOp InitialValue(xla::XlaBuilder* builder) override {
+    return xla::MinFiniteValue(builder, type_);
+  };
+  xla::XlaOp Combine(xla::XlaOp a, xla::XlaOp b) override {
+    return xla::Max(a, b);
+  };
+};
+
+REGISTER_XLA_OP(
+    Name("UnsortedSegmentMax").CompileTimeConstantInput("num_segments"),
+    SegmentMax</*indices_are_sorted=*/false>);
+REGISTER_XLA_OP(Name("SegmentMaxV2").CompileTimeConstantInput("num_segments"),
+                SegmentMax</*indices_are_sorted=*/true>);
 
 }  // namespace
 }  // namespace tensorflow

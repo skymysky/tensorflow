@@ -20,13 +20,9 @@ limitations under the License.
 
 namespace tensorflow {
 
-VariantTensorData::VariantTensorData() {}
-
-VariantTensorData::VariantTensorData(const VariantTensorDataProto& proto) {
-  FromProto(proto);
+VariantTensorData::VariantTensorData(VariantTensorDataProto proto) {
+  FromProto(std::move(proto));
 }
-
-VariantTensorData::~VariantTensorData() {}
 
 int VariantTensorData::tensors_size() const { return tensors_.size(); }
 
@@ -34,23 +30,27 @@ const Tensor& VariantTensorData::tensors(int index) const {
   return tensors_[index];
 }
 
-std::vector<Tensor> VariantTensorData::tensors() { return tensors_; }
+const std::vector<Tensor>& VariantTensorData::tensors() const {
+  return tensors_;
+}
 
 Tensor* VariantTensorData::add_tensors() {
   tensors_.emplace_back();
   return &(tensors_[tensors_.size() - 1]);
 }
 
-void VariantTensorData::ToProto(VariantTensorDataProto* proto) const {
+bool VariantTensorData::ToProto(VariantTensorDataProto* proto) const {
   proto->set_type_name(type_name());
   proto->set_metadata(metadata_);
   proto->clear_tensors();
   for (const auto& tensor : tensors_) {
-    tensor.AsProtoField(proto->mutable_tensors()->Add());
+    if (!tensor.AsProtoField(proto->mutable_tensors()->Add())) return false;
   }
+  return true;
 }
 
-bool VariantTensorData::FromProto(const VariantTensorDataProto& proto) {
+bool VariantTensorData::FromProto(VariantTensorDataProto proto) {
+  // TODO(ebrevdo): Do this lazily.
   set_type_name(proto.type_name());
   set_metadata(proto.metadata());
   for (const auto& tensor : proto.tensors()) {
@@ -61,36 +61,47 @@ bool VariantTensorData::FromProto(const VariantTensorDataProto& proto) {
   return true;
 }
 
-string VariantTensorData::SerializeAsString() const {
+bool VariantTensorData::FromConstProto(const VariantTensorDataProto& proto) {
+  set_type_name(proto.type_name());
+  set_metadata(proto.metadata());
+  for (const auto& tensor : proto.tensors()) {
+    Tensor tmp;
+    if (!tmp.FromProto(tensor)) return false;
+    tensors_.push_back(tmp);
+  }
+  return true;
+}
+
+std::string VariantTensorData::SerializeAsString() const {
   VariantTensorDataProto proto;
-  ToProto(&proto);
+  if (!ToProto(&proto)) return "";
   return proto.SerializeAsString();
 }
 
-bool VariantTensorData::SerializeToString(string* buf) {
+bool VariantTensorData::SerializeToString(std::string* buf) {
   VariantTensorDataProto proto;
-  ToProto(&proto);
+  if (!ToProto(&proto)) return false;
   return proto.SerializeToString(buf);
 }
 
-bool VariantTensorData::ParseFromString(const string& s) {
+bool VariantTensorData::ParseFromString(std::string s) {
   VariantTensorDataProto proto;
   const bool status = proto.ParseFromString(s);
-  if (status) FromProto(proto);
+  if (status) FromProto(std::move(proto));
   return status;
 }
 
-string VariantTensorData::DebugString() const {
-  string repeated_field = "";
+std::string VariantTensorData::DebugString() const {
+  std::string repeated_field = "";
   for (const auto& t : tensors_) {
     repeated_field =
-        strings::StrCat(repeated_field, " tensors: ", t.DebugString());
+        absl::StrCat(repeated_field, " tensors: ", t.DebugString());
   }
   return strings::StrCat("type_name: ", type_name(), " metadata: ", metadata_,
                          repeated_field);
 }
 
-string ProtoDebugString(const VariantTensorData& object) {
+std::string ProtoDebugString(const VariantTensorData& object) {
   return object.DebugString();
 }
 

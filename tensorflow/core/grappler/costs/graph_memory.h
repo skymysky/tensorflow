@@ -13,8 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef TENSORFLOW_GRAPPLER_COSTS_GRAPH_MEMORY_H_
-#define TENSORFLOW_GRAPPLER_COSTS_GRAPH_MEMORY_H_
+#ifndef TENSORFLOW_CORE_GRAPPLER_COSTS_GRAPH_MEMORY_H_
+#define TENSORFLOW_CORE_GRAPPLER_COSTS_GRAPH_MEMORY_H_
 
 #include "tensorflow/core/framework/node_def.pb.h"
 #include "tensorflow/core/grappler/clusters/cluster.h"
@@ -29,30 +29,30 @@ namespace grappler {
 class GraphMemory {
  public:
   struct LiveTensor {
-    string node;
+    std::string node;
     int output_id;
     size_t memory_used;
     Costs::Duration allocation_time;
     Costs::Duration deallocation_time;
   };
   struct MemoryUsage {
-    int64 used_memory;
+    int64_t used_memory;
     std::vector<LiveTensor> live_tensors;
   };
 
   explicit GraphMemory(const GrapplerItem& item)
       : item_(item), unknown_usage_({-1, {}}) {}
 
-  Status InferStatically(
-      const std::unordered_map<string, DeviceProperties>& devices);
-  Status InferDynamically(Cluster* cluster);
+  absl::Status InferStatically(
+      const std::unordered_map<std::string, DeviceProperties>& devices);
+  absl::Status InferDynamically(Cluster* cluster);
 
   // Worst case memory usage in bytes, or -1 if the usage is unknown. If there
   // are multiple devices, returns the highest per device memory usage.
-  int64 GetWorstCaseMemoryUsage() const;
+  int64_t GetWorstCaseMemoryUsage() const;
 
   // Returns the peak memory usage for the specified device.
-  const MemoryUsage& GetPeakMemoryUsage(const string& device) const {
+  const MemoryUsage& GetPeakMemoryUsage(const std::string& device) const {
     auto it = peak_usage_.find(device);
     if (it == peak_usage_.end()) {
       return unknown_usage_;
@@ -62,20 +62,20 @@ class GraphMemory {
 
  private:
   void InferMemUsageForNodes(const std::vector<const NodeDef*>& nodes,
-                             GraphProperties* properties, int64* worst_case,
-                             int64* best_case) const;
-  int64 InferMemUsageForNeighbors(
+                             GraphProperties* properties, int64_t* worst_case,
+                             int64_t* best_case) const;
+  int64_t InferMemUsageForNeighbors(
       const std::vector<OpInfo::TensorProperties>& props) const;
 
   void InferFromTrace(const StepStats& timeline);
 
-  GrapplerItem item_;
-  std::unordered_map<string, int64> worst_case_memory_usage_;
-  std::unordered_map<string, MemoryUsage> peak_usage_;
+  const GrapplerItem& item_;
+  std::unordered_map<std::string, int64_t> worst_case_memory_usage_;
+  std::unordered_map<std::string, MemoryUsage> peak_usage_;
   const MemoryUsage unknown_usage_;
 };
 
 }  // end namespace grappler
 }  // end namespace tensorflow
 
-#endif  // TENSORFLOW_GRAPPLER_COSTS_GRAPH_MEMORY_H_
+#endif  // TENSORFLOW_CORE_GRAPPLER_COSTS_GRAPH_MEMORY_H_

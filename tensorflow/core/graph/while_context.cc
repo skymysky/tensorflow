@@ -17,13 +17,13 @@ limitations under the License.
 
 namespace tensorflow {
 
-WhileContext::WhileContext(StringPiece frame_name,
+WhileContext::WhileContext(absl::string_view frame_name,
                            std::vector<Node*> enter_nodes,
                            std::vector<Node*> exit_nodes,
                            OutputTensor cond_output,
                            std::vector<OutputTensor> body_inputs,
                            std::vector<OutputTensor> body_outputs)
-    : frame_name_(frame_name.ToString()),
+    : frame_name_(frame_name),
       enter_nodes_(std::move(enter_nodes)),
       exit_nodes_(std::move(exit_nodes)),
       cond_output_(cond_output),
